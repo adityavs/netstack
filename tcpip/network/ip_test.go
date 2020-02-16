@@ -1,6 +1,16 @@
-// Copyright 2016 The Netstack Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package ip_test
 
@@ -10,9 +20,27 @@ import (
 	"github.com/google/netstack/tcpip"
 	"github.com/google/netstack/tcpip/buffer"
 	"github.com/google/netstack/tcpip/header"
+	"github.com/google/netstack/tcpip/link/loopback"
 	"github.com/google/netstack/tcpip/network/ipv4"
 	"github.com/google/netstack/tcpip/network/ipv6"
 	"github.com/google/netstack/tcpip/stack"
+	"github.com/google/netstack/tcpip/transport/tcp"
+	"github.com/google/netstack/tcpip/transport/udp"
+)
+
+const (
+	localIpv4Addr      = "\x0a\x00\x00\x01"
+	localIpv4PrefixLen = 24
+	remoteIpv4Addr     = "\x0a\x00\x00\x02"
+	ipv4SubnetAddr     = "\x0a\x00\x00\x00"
+	ipv4SubnetMask     = "\xff\xff\xff\x00"
+	ipv4Gateway        = "\x0a\x00\x00\x03"
+	localIpv6Addr      = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"
+	localIpv6PrefixLen = 120
+	remoteIpv6Addr     = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
+	ipv6SubnetAddr     = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+	ipv6SubnetMask     = "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00"
+	ipv6Gateway        = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03"
 )
 
 // testObject implements two interfaces: LinkEndpoint and TransportDispatcher.
@@ -40,7 +68,7 @@ type testObject struct {
 // checkValues verifies that the transport protocol, data contents, src & dst
 // addresses of a packet match what's expected. If any field doesn't match, the
 // test fails.
-func (t *testObject) checkValues(protocol tcpip.TransportProtocolNumber, vv *buffer.VectorisedView, srcAddr, dstAddr tcpip.Address) {
+func (t *testObject) checkValues(protocol tcpip.TransportProtocolNumber, vv buffer.VectorisedView, srcAddr, dstAddr tcpip.Address) {
 	v := vv.ToView()
 	if protocol != t.protocol {
 		t.t.Errorf("protocol = %v, want %v", protocol, t.protocol)
@@ -68,16 +96,16 @@ func (t *testObject) checkValues(protocol tcpip.TransportProtocolNumber, vv *buf
 // DeliverTransportPacket is called by network endpoints after parsing incoming
 // packets. This is used by the test object to verify that the results of the
 // parsing are expected.
-func (t *testObject) DeliverTransportPacket(r *stack.Route, protocol tcpip.TransportProtocolNumber, vv *buffer.VectorisedView) {
-	t.checkValues(protocol, vv, r.RemoteAddress, r.LocalAddress)
+func (t *testObject) DeliverTransportPacket(r *stack.Route, protocol tcpip.TransportProtocolNumber, pkt tcpip.PacketBuffer) {
+	t.checkValues(protocol, pkt.Data, r.RemoteAddress, r.LocalAddress)
 	t.dataCalls++
 }
 
 // DeliverTransportControlPacket is called by network endpoints after parsing
 // incoming control (ICMP) packets. This is used by the test object to verify
 // that the results of the parsing are expected.
-func (t *testObject) DeliverTransportControlPacket(local, remote tcpip.Address, net tcpip.NetworkProtocolNumber, trans tcpip.TransportProtocolNumber, typ stack.ControlType, extra uint32, vv *buffer.VectorisedView) {
-	t.checkValues(trans, vv, remote, local)
+func (t *testObject) DeliverTransportControlPacket(local, remote tcpip.Address, net tcpip.NetworkProtocolNumber, trans tcpip.TransportProtocolNumber, typ stack.ControlType, extra uint32, pkt tcpip.PacketBuffer) {
+	t.checkValues(trans, pkt.Data, remote, local)
 	if typ != t.typ {
 		t.t.Errorf("typ = %v, want %v", typ, t.typ)
 	}
@@ -89,6 +117,11 @@ func (t *testObject) DeliverTransportControlPacket(local, remote tcpip.Address, 
 
 // Attach is only implemented to satisfy the LinkEndpoint interface.
 func (*testObject) Attach(stack.NetworkDispatcher) {}
+
+// IsAttached implements stack.LinkEndpoint.IsAttached.
+func (*testObject) IsAttached() bool {
+	return true
+}
 
 // MTU implements stack.LinkEndpoint.MTU. It just returns a constant that
 // matches the linux loopback MTU.
@@ -111,36 +144,78 @@ func (*testObject) LinkAddress() tcpip.LinkAddress {
 	return ""
 }
 
+// Wait implements stack.LinkEndpoint.Wait.
+func (*testObject) Wait() {}
+
 // WritePacket is called by network endpoints after producing a packet and
 // writing it to the link endpoint. This is used by the test object to verify
 // that the produced packet is as expected.
-func (t *testObject) WritePacket(_ *stack.Route, hdr *buffer.Prependable, payload buffer.View, protocol tcpip.NetworkProtocolNumber) *tcpip.Error {
+func (t *testObject) WritePacket(_ *stack.Route, _ *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt tcpip.PacketBuffer) *tcpip.Error {
 	var prot tcpip.TransportProtocolNumber
 	var srcAddr tcpip.Address
 	var dstAddr tcpip.Address
 
 	if t.v4 {
-		h := header.IPv4(hdr.UsedBytes())
+		h := header.IPv4(pkt.Header.View())
 		prot = tcpip.TransportProtocolNumber(h.Protocol())
 		srcAddr = h.SourceAddress()
 		dstAddr = h.DestinationAddress()
 
 	} else {
-		h := header.IPv6(hdr.UsedBytes())
+		h := header.IPv6(pkt.Header.View())
 		prot = tcpip.TransportProtocolNumber(h.NextHeader())
 		srcAddr = h.SourceAddress()
 		dstAddr = h.DestinationAddress()
 	}
-	var views [1]buffer.View
-	vv := payload.ToVectorisedView(views)
-	t.checkValues(prot, &vv, srcAddr, dstAddr)
+	t.checkValues(prot, pkt.Data, srcAddr, dstAddr)
 	return nil
+}
+
+// WritePackets implements stack.LinkEndpoint.WritePackets.
+func (t *testObject) WritePackets(_ *stack.Route, _ *stack.GSO, hdr []stack.PacketDescriptor, payload buffer.VectorisedView, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
+	panic("not implemented")
+}
+
+func (t *testObject) WriteRawPacket(_ buffer.VectorisedView) *tcpip.Error {
+	return tcpip.ErrNotSupported
+}
+
+func buildIPv4Route(local, remote tcpip.Address) (stack.Route, *tcpip.Error) {
+	s := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocol{ipv4.NewProtocol()},
+		TransportProtocols: []stack.TransportProtocol{udp.NewProtocol(), tcp.NewProtocol()},
+	})
+	s.CreateNIC(1, loopback.New())
+	s.AddAddress(1, ipv4.ProtocolNumber, local)
+	s.SetRouteTable([]tcpip.Route{{
+		Destination: header.IPv4EmptySubnet,
+		Gateway:     ipv4Gateway,
+		NIC:         1,
+	}})
+
+	return s.FindRoute(1, local, remote, ipv4.ProtocolNumber, false /* multicastLoop */)
+}
+
+func buildIPv6Route(local, remote tcpip.Address) (stack.Route, *tcpip.Error) {
+	s := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocol{ipv6.NewProtocol()},
+		TransportProtocols: []stack.TransportProtocol{udp.NewProtocol(), tcp.NewProtocol()},
+	})
+	s.CreateNIC(1, loopback.New())
+	s.AddAddress(1, ipv6.ProtocolNumber, local)
+	s.SetRouteTable([]tcpip.Route{{
+		Destination: header.IPv6EmptySubnet,
+		Gateway:     ipv6Gateway,
+		NIC:         1,
+	}})
+
+	return s.FindRoute(1, local, remote, ipv6.ProtocolNumber, false /* multicastLoop */)
 }
 
 func TestIPv4Send(t *testing.T) {
 	o := testObject{t: t, v4: true}
 	proto := ipv4.NewProtocol()
-	ep, err := proto.NewEndpoint(1, "\x0a\x00\x00\x01", nil, nil, &o)
+	ep, err := proto.NewEndpoint(1, tcpip.AddressWithPrefix{localIpv4Addr, localIpv4PrefixLen}, nil, nil, &o)
 	if err != nil {
 		t.Fatalf("NewEndpoint failed: %v", err)
 	}
@@ -156,15 +231,18 @@ func TestIPv4Send(t *testing.T) {
 
 	// Issue the write.
 	o.protocol = 123
-	o.srcAddr = "\x0a\x00\x00\x01"
-	o.dstAddr = "\x0a\x00\x00\x02"
+	o.srcAddr = localIpv4Addr
+	o.dstAddr = remoteIpv4Addr
 	o.contents = payload
 
-	r := stack.Route{
-		RemoteAddress: o.dstAddr,
-		LocalAddress:  o.srcAddr,
+	r, err := buildIPv4Route(localIpv4Addr, remoteIpv4Addr)
+	if err != nil {
+		t.Fatalf("could not find route: %v", err)
 	}
-	if err := ep.WritePacket(&r, &hdr, payload, 123); err != nil {
+	if err := ep.WritePacket(&r, nil /* gso */, stack.NetworkHeaderParams{Protocol: 123, TTL: 123, TOS: stack.DefaultTOS}, stack.PacketOut, tcpip.PacketBuffer{
+		Header: hdr,
+		Data:   payload.ToVectorisedView(),
+	}); err != nil {
 		t.Fatalf("WritePacket failed: %v", err)
 	}
 }
@@ -172,7 +250,7 @@ func TestIPv4Send(t *testing.T) {
 func TestIPv4Receive(t *testing.T) {
 	o := testObject{t: t, v4: true}
 	proto := ipv4.NewProtocol()
-	ep, err := proto.NewEndpoint(1, "\x0a\x00\x00\x01", nil, &o, nil)
+	ep, err := proto.NewEndpoint(1, tcpip.AddressWithPrefix{localIpv4Addr, localIpv4PrefixLen}, nil, &o, nil)
 	if err != nil {
 		t.Fatalf("NewEndpoint failed: %v", err)
 	}
@@ -185,8 +263,8 @@ func TestIPv4Receive(t *testing.T) {
 		TotalLength: uint16(totalLen),
 		TTL:         20,
 		Protocol:    10,
-		SrcAddr:     "\x0a\x00\x00\x02",
-		DstAddr:     "\x0a\x00\x00\x01",
+		SrcAddr:     remoteIpv4Addr,
+		DstAddr:     localIpv4Addr,
 	})
 
 	// Make payload be non-zero.
@@ -196,17 +274,17 @@ func TestIPv4Receive(t *testing.T) {
 
 	// Give packet to ipv4 endpoint, dispatcher will validate that it's ok.
 	o.protocol = 10
-	o.srcAddr = "\x0a\x00\x00\x02"
-	o.dstAddr = "\x0a\x00\x00\x01"
+	o.srcAddr = remoteIpv4Addr
+	o.dstAddr = localIpv4Addr
 	o.contents = view[header.IPv4MinimumSize:totalLen]
 
-	r := stack.Route{
-		LocalAddress:  o.dstAddr,
-		RemoteAddress: o.srcAddr,
+	r, err := buildIPv4Route(localIpv4Addr, remoteIpv4Addr)
+	if err != nil {
+		t.Fatalf("could not find route: %v", err)
 	}
-	var views [1]buffer.View
-	vv := view.ToVectorisedView(views)
-	ep.HandlePacket(&r, &vv)
+	ep.HandlePacket(&r, tcpip.PacketBuffer{
+		Data: view.ToVectorisedView(),
+	})
 	if o.dataCalls != 1 {
 		t.Fatalf("Bad number of data calls: got %x, want 1", o.dataCalls)
 	}
@@ -227,27 +305,26 @@ func TestIPv4ReceiveControl(t *testing.T) {
 		{"Truncated (10 bytes missing)", 0, 0, header.ICMPv4FragmentationNeeded, stack.ControlPacketTooBig, mtu, 10},
 		{"Truncated (missing IPv4 header)", 0, 0, header.ICMPv4FragmentationNeeded, stack.ControlPacketTooBig, mtu, header.IPv4MinimumSize + 8},
 		{"Truncated (missing 'extra info')", 0, 0, header.ICMPv4FragmentationNeeded, stack.ControlPacketTooBig, mtu, 4 + header.IPv4MinimumSize + 8},
-		{"Truncated (missing ICMP header)", 0, 0, header.ICMPv4FragmentationNeeded, stack.ControlPacketTooBig, mtu, header.ICMPv4DstUnreachableMinimumSize + header.IPv4MinimumSize + 8},
+		{"Truncated (missing ICMP header)", 0, 0, header.ICMPv4FragmentationNeeded, stack.ControlPacketTooBig, mtu, header.ICMPv4MinimumSize + header.IPv4MinimumSize + 8},
 		{"Port unreachable", 1, 0, header.ICMPv4PortUnreachable, stack.ControlPortUnreachable, 0, 0},
 		{"Non-zero fragment offset", 0, 100, header.ICMPv4PortUnreachable, stack.ControlPortUnreachable, 0, 0},
-		{"Zero-length packet", 0, 0, header.ICMPv4PortUnreachable, stack.ControlPortUnreachable, 0, 2*header.IPv4MinimumSize + header.ICMPv4DstUnreachableMinimumSize + 8},
+		{"Zero-length packet", 0, 0, header.ICMPv4PortUnreachable, stack.ControlPortUnreachable, 0, 2*header.IPv4MinimumSize + header.ICMPv4MinimumSize + 8},
 	}
-	r := stack.Route{
-		LocalAddress:  "\x0a\x00\x00\x01",
-		RemoteAddress: "\x0a\x00\x00\xbb",
+	r, err := buildIPv4Route(localIpv4Addr, "\x0a\x00\x00\xbb")
+	if err != nil {
+		t.Fatal(err)
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			var views [1]buffer.View
 			o := testObject{t: t}
 			proto := ipv4.NewProtocol()
-			ep, err := proto.NewEndpoint(1, "\x0a\x00\x00\x01", nil, &o, nil)
+			ep, err := proto.NewEndpoint(1, tcpip.AddressWithPrefix{localIpv4Addr, localIpv4PrefixLen}, nil, &o, nil)
 			if err != nil {
 				t.Fatalf("NewEndpoint failed: %v", err)
 			}
 			defer ep.Close()
 
-			const dataOffset = header.IPv4MinimumSize*2 + header.ICMPv4MinimumSize + 4
+			const dataOffset = header.IPv4MinimumSize*2 + header.ICMPv4MinimumSize
 			view := buffer.NewView(dataOffset + 8)
 
 			// Create the outer IPv4 header.
@@ -258,25 +335,26 @@ func TestIPv4ReceiveControl(t *testing.T) {
 				TTL:         20,
 				Protocol:    uint8(header.ICMPv4ProtocolNumber),
 				SrcAddr:     "\x0a\x00\x00\xbb",
-				DstAddr:     "\x0a\x00\x00\x01",
+				DstAddr:     localIpv4Addr,
 			})
 
 			// Create the ICMP header.
 			icmp := header.ICMPv4(view[header.IPv4MinimumSize:])
 			icmp.SetType(header.ICMPv4DstUnreachable)
 			icmp.SetCode(c.code)
-			copy(view[header.IPv4MinimumSize+header.ICMPv4MinimumSize:], []byte{0xde, 0xad, 0xbe, 0xef})
+			icmp.SetIdent(0xdead)
+			icmp.SetSequence(0xbeef)
 
 			// Create the inner IPv4 header.
-			ip = header.IPv4(view[header.IPv4MinimumSize+header.ICMPv4MinimumSize+4:])
+			ip = header.IPv4(view[header.IPv4MinimumSize+header.ICMPv4MinimumSize:])
 			ip.Encode(&header.IPv4Fields{
 				IHL:            header.IPv4MinimumSize,
 				TotalLength:    100,
 				TTL:            20,
 				Protocol:       10,
 				FragmentOffset: c.fragmentOffset,
-				SrcAddr:        "\x0a\x00\x00\x01",
-				DstAddr:        "\x0a\x00\x00\x02",
+				SrcAddr:        localIpv4Addr,
+				DstAddr:        remoteIpv4Addr,
 			})
 
 			// Make payload be non-zero.
@@ -287,15 +365,16 @@ func TestIPv4ReceiveControl(t *testing.T) {
 			// Give packet to IPv4 endpoint, dispatcher will validate that
 			// it's ok.
 			o.protocol = 10
-			o.srcAddr = "\x0a\x00\x00\x02"
-			o.dstAddr = "\x0a\x00\x00\x01"
+			o.srcAddr = remoteIpv4Addr
+			o.dstAddr = localIpv4Addr
 			o.contents = view[dataOffset:]
 			o.typ = c.expectedTyp
 			o.extra = c.expectedExtra
 
-			vv := view.ToVectorisedView(views)
-			vv.CapLength(len(view) - c.trunc)
-			ep.HandlePacket(&r, &vv)
+			vv := view[:len(view)-c.trunc].ToVectorisedView()
+			ep.HandlePacket(&r, tcpip.PacketBuffer{
+				Data: vv,
+			})
 			if want := c.expectedCount; o.controlCalls != want {
 				t.Fatalf("Bad number of control calls for %q case: got %v, want %v", c.name, o.controlCalls, want)
 			}
@@ -306,7 +385,7 @@ func TestIPv4ReceiveControl(t *testing.T) {
 func TestIPv4FragmentationReceive(t *testing.T) {
 	o := testObject{t: t, v4: true}
 	proto := ipv4.NewProtocol()
-	ep, err := proto.NewEndpoint(1, "\x0a\x00\x00\x01", nil, &o, nil)
+	ep, err := proto.NewEndpoint(1, tcpip.AddressWithPrefix{localIpv4Addr, localIpv4PrefixLen}, nil, &o, nil)
 	if err != nil {
 		t.Fatalf("NewEndpoint failed: %v", err)
 	}
@@ -322,8 +401,8 @@ func TestIPv4FragmentationReceive(t *testing.T) {
 		Protocol:       10,
 		FragmentOffset: 0,
 		Flags:          header.IPv4FlagMoreFragments,
-		SrcAddr:        "\x0a\x00\x00\x02",
-		DstAddr:        "\x0a\x00\x00\x01",
+		SrcAddr:        remoteIpv4Addr,
+		DstAddr:        localIpv4Addr,
 	})
 	// Make payload be non-zero.
 	for i := header.IPv4MinimumSize; i < totalLen; i++ {
@@ -338,8 +417,8 @@ func TestIPv4FragmentationReceive(t *testing.T) {
 		TTL:            20,
 		Protocol:       10,
 		FragmentOffset: 24,
-		SrcAddr:        "\x0a\x00\x00\x02",
-		DstAddr:        "\x0a\x00\x00\x01",
+		SrcAddr:        remoteIpv4Addr,
+		DstAddr:        localIpv4Addr,
 	})
 	// Make payload be non-zero.
 	for i := header.IPv4MinimumSize; i < totalLen; i++ {
@@ -348,28 +427,27 @@ func TestIPv4FragmentationReceive(t *testing.T) {
 
 	// Give packet to ipv4 endpoint, dispatcher will validate that it's ok.
 	o.protocol = 10
-	o.srcAddr = "\x0a\x00\x00\x02"
-	o.dstAddr = "\x0a\x00\x00\x01"
+	o.srcAddr = remoteIpv4Addr
+	o.dstAddr = localIpv4Addr
 	o.contents = append(frag1[header.IPv4MinimumSize:totalLen], frag2[header.IPv4MinimumSize:totalLen]...)
 
-	r := stack.Route{
-		LocalAddress:  o.dstAddr,
-		RemoteAddress: o.srcAddr,
+	r, err := buildIPv4Route(localIpv4Addr, remoteIpv4Addr)
+	if err != nil {
+		t.Fatalf("could not find route: %v", err)
 	}
 
 	// Send first segment.
-	var views1 [1]buffer.View
-	vv1 := frag1.ToVectorisedView(views1)
-	ep.HandlePacket(&r, &vv1)
+	ep.HandlePacket(&r, tcpip.PacketBuffer{
+		Data: frag1.ToVectorisedView(),
+	})
 	if o.dataCalls != 0 {
 		t.Fatalf("Bad number of data calls: got %x, want 0", o.dataCalls)
 	}
 
 	// Send second segment.
-	var views2 [1]buffer.View
-	vv2 := frag2.ToVectorisedView(views2)
-	ep.HandlePacket(&r, &vv2)
-
+	ep.HandlePacket(&r, tcpip.PacketBuffer{
+		Data: frag2.ToVectorisedView(),
+	})
 	if o.dataCalls != 1 {
 		t.Fatalf("Bad number of data calls: got %x, want 1", o.dataCalls)
 	}
@@ -378,7 +456,7 @@ func TestIPv4FragmentationReceive(t *testing.T) {
 func TestIPv6Send(t *testing.T) {
 	o := testObject{t: t}
 	proto := ipv6.NewProtocol()
-	ep, err := proto.NewEndpoint(1, "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01", nil, nil, &o)
+	ep, err := proto.NewEndpoint(1, tcpip.AddressWithPrefix{localIpv6Addr, localIpv6PrefixLen}, nil, nil, &o)
 	if err != nil {
 		t.Fatalf("NewEndpoint failed: %v", err)
 	}
@@ -394,15 +472,18 @@ func TestIPv6Send(t *testing.T) {
 
 	// Issue the write.
 	o.protocol = 123
-	o.srcAddr = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"
-	o.dstAddr = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
+	o.srcAddr = localIpv6Addr
+	o.dstAddr = remoteIpv6Addr
 	o.contents = payload
 
-	r := stack.Route{
-		RemoteAddress: o.dstAddr,
-		LocalAddress:  o.srcAddr,
+	r, err := buildIPv6Route(localIpv6Addr, remoteIpv6Addr)
+	if err != nil {
+		t.Fatalf("could not find route: %v", err)
 	}
-	if err := ep.WritePacket(&r, &hdr, payload, 123); err != nil {
+	if err := ep.WritePacket(&r, nil /* gso */, stack.NetworkHeaderParams{Protocol: 123, TTL: 123, TOS: stack.DefaultTOS}, stack.PacketOut, tcpip.PacketBuffer{
+		Header: hdr,
+		Data:   payload.ToVectorisedView(),
+	}); err != nil {
 		t.Fatalf("WritePacket failed: %v", err)
 	}
 }
@@ -410,7 +491,7 @@ func TestIPv6Send(t *testing.T) {
 func TestIPv6Receive(t *testing.T) {
 	o := testObject{t: t}
 	proto := ipv6.NewProtocol()
-	ep, err := proto.NewEndpoint(1, "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01", nil, &o, nil)
+	ep, err := proto.NewEndpoint(1, tcpip.AddressWithPrefix{localIpv6Addr, localIpv6PrefixLen}, nil, &o, nil)
 	if err != nil {
 		t.Fatalf("NewEndpoint failed: %v", err)
 	}
@@ -422,8 +503,8 @@ func TestIPv6Receive(t *testing.T) {
 		PayloadLength: uint16(totalLen - header.IPv6MinimumSize),
 		NextHeader:    10,
 		HopLimit:      20,
-		SrcAddr:       "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02",
-		DstAddr:       "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01",
+		SrcAddr:       remoteIpv6Addr,
+		DstAddr:       localIpv6Addr,
 	})
 
 	// Make payload be non-zero.
@@ -433,18 +514,18 @@ func TestIPv6Receive(t *testing.T) {
 
 	// Give packet to ipv6 endpoint, dispatcher will validate that it's ok.
 	o.protocol = 10
-	o.srcAddr = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
-	o.dstAddr = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"
+	o.srcAddr = remoteIpv6Addr
+	o.dstAddr = localIpv6Addr
 	o.contents = view[header.IPv6MinimumSize:totalLen]
 
-	r := stack.Route{
-		LocalAddress:  o.dstAddr,
-		RemoteAddress: o.srcAddr,
+	r, err := buildIPv6Route(localIpv6Addr, remoteIpv6Addr)
+	if err != nil {
+		t.Fatalf("could not find route: %v", err)
 	}
-	var views [1]buffer.View
-	vv := view.ToVectorisedView(views)
-	ep.HandlePacket(&r, &vv)
 
+	ep.HandlePacket(&r, tcpip.PacketBuffer{
+		Data: view.ToVectorisedView(),
+	})
 	if o.dataCalls != 1 {
 		t.Fatalf("Bad number of data calls: got %x, want 1", o.dataCalls)
 	}
@@ -454,6 +535,7 @@ func TestIPv6ReceiveControl(t *testing.T) {
 	newUint16 := func(v uint16) *uint16 { return &v }
 
 	const mtu = 0xffff
+	const outerSrcAddr = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xaa"
 	cases := []struct {
 		name           string
 		expectedCount  int
@@ -475,23 +557,25 @@ func TestIPv6ReceiveControl(t *testing.T) {
 		{"Non-zero fragment offset", 0, newUint16(100), header.ICMPv6DstUnreachable, header.ICMPv6PortUnreachable, stack.ControlPortUnreachable, 0, 0},
 		{"Zero-length packet", 0, nil, header.ICMPv6DstUnreachable, header.ICMPv6PortUnreachable, stack.ControlPortUnreachable, 0, 2*header.IPv6MinimumSize + header.ICMPv6DstUnreachableMinimumSize + 8},
 	}
-	r := stack.Route{
-		LocalAddress:  "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01",
-		RemoteAddress: "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xaa",
+	r, err := buildIPv6Route(
+		localIpv6Addr,
+		"\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xaa",
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			var views [1]buffer.View
 			o := testObject{t: t}
 			proto := ipv6.NewProtocol()
-			ep, err := proto.NewEndpoint(1, "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01", nil, &o, nil)
+			ep, err := proto.NewEndpoint(1, tcpip.AddressWithPrefix{localIpv6Addr, localIpv6PrefixLen}, nil, &o, nil)
 			if err != nil {
 				t.Fatalf("NewEndpoint failed: %v", err)
 			}
 
 			defer ep.Close()
 
-			dataOffset := header.IPv6MinimumSize*2 + header.ICMPv6MinimumSize + 4
+			dataOffset := header.IPv6MinimumSize*2 + header.ICMPv6MinimumSize
 			if c.fragmentOffset != nil {
 				dataOffset += header.IPv6FragmentHeaderSize
 			}
@@ -503,30 +587,31 @@ func TestIPv6ReceiveControl(t *testing.T) {
 				PayloadLength: uint16(len(view) - header.IPv6MinimumSize - c.trunc),
 				NextHeader:    uint8(header.ICMPv6ProtocolNumber),
 				HopLimit:      20,
-				SrcAddr:       "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xaa",
-				DstAddr:       "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01",
+				SrcAddr:       outerSrcAddr,
+				DstAddr:       localIpv6Addr,
 			})
 
 			// Create the ICMP header.
 			icmp := header.ICMPv6(view[header.IPv6MinimumSize:])
 			icmp.SetType(c.typ)
 			icmp.SetCode(c.code)
-			copy(view[header.IPv6MinimumSize+header.ICMPv6MinimumSize:], []byte{0xde, 0xad, 0xbe, 0xef})
+			icmp.SetIdent(0xdead)
+			icmp.SetSequence(0xbeef)
 
 			// Create the inner IPv6 header.
-			ip = header.IPv6(view[header.IPv6MinimumSize+header.ICMPv6MinimumSize+4:])
+			ip = header.IPv6(view[header.IPv6MinimumSize+header.ICMPv6PayloadOffset:])
 			ip.Encode(&header.IPv6Fields{
 				PayloadLength: 100,
 				NextHeader:    10,
 				HopLimit:      20,
-				SrcAddr:       "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01",
-				DstAddr:       "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02",
+				SrcAddr:       localIpv6Addr,
+				DstAddr:       remoteIpv6Addr,
 			})
 
 			// Build the fragmentation header if needed.
 			if c.fragmentOffset != nil {
 				ip.SetNextHeader(header.IPv6FragmentHeader)
-				frag := header.IPv6Fragment(view[2*header.IPv6MinimumSize+header.ICMPv6MinimumSize+4:])
+				frag := header.IPv6Fragment(view[2*header.IPv6MinimumSize+header.ICMPv6MinimumSize:])
 				frag.Encode(&header.IPv6FragmentFields{
 					NextHeader:     10,
 					FragmentOffset: *c.fragmentOffset,
@@ -543,15 +628,18 @@ func TestIPv6ReceiveControl(t *testing.T) {
 			// Give packet to IPv6 endpoint, dispatcher will validate that
 			// it's ok.
 			o.protocol = 10
-			o.srcAddr = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
-			o.dstAddr = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"
+			o.srcAddr = remoteIpv6Addr
+			o.dstAddr = localIpv6Addr
 			o.contents = view[dataOffset:]
 			o.typ = c.expectedTyp
 			o.extra = c.expectedExtra
 
-			vv := view.ToVectorisedView(views)
-			vv.CapLength(len(view) - c.trunc)
-			ep.HandlePacket(&r, &vv)
+			// Set ICMPv6 checksum.
+			icmp.SetChecksum(header.ICMPv6Checksum(icmp, outerSrcAddr, localIpv6Addr, buffer.VectorisedView{}))
+
+			ep.HandlePacket(&r, tcpip.PacketBuffer{
+				Data: view[:len(view)-c.trunc].ToVectorisedView(),
+			})
 			if want := c.expectedCount; o.controlCalls != want {
 				t.Fatalf("Bad number of control calls for %q case: got %v, want %v", c.name, o.controlCalls, want)
 			}

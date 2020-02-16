@@ -1,16 +1,28 @@
-// Copyright 2016 The Netstack Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 // Package ipv6 contains the implementation of the ipv6 network protocol. To use
 // it in the networking stack, this package must be added to the project, and
-// activated on the stack by passing ipv6.ProtocolName (or "ipv6") as one of the
-// network protocols when calling stack.New(). Then endpoints can be created
-// by passing ipv6.ProtocolNumber as the network protocol number when calling
+// activated on the stack by passing ipv6.NewProtocol() as one of the network
+// protocols when calling stack.New(). Then endpoints can be created by passing
+// ipv6.ProtocolNumber as the network protocol number when calling
 // Stack.NewEndpoint().
 package ipv6
 
 import (
+	"sync/atomic"
+
 	"github.com/google/netstack/tcpip"
 	"github.com/google/netstack/tcpip/buffer"
 	"github.com/google/netstack/tcpip/header"
@@ -18,32 +30,31 @@ import (
 )
 
 const (
-	// ProtocolName is the string representation of the ipv6 protocol name.
-	ProtocolName = "ipv6"
-
 	// ProtocolNumber is the ipv6 protocol number.
 	ProtocolNumber = header.IPv6ProtocolNumber
 
 	// maxTotalSize is maximum size that can be encoded in the 16-bit
 	// PayloadLength field of the ipv6 header.
 	maxPayloadSize = 0xffff
+
+	// DefaultTTL is the default hop limit for IPv6 Packets egressed by
+	// Netstack.
+	DefaultTTL = 64
 )
 
-type address [header.IPv6AddressSize]byte
-
 type endpoint struct {
-	nicid      tcpip.NICID
-	id         stack.NetworkEndpointID
-	address    address
-	linkEP     stack.LinkEndpoint
-	dispatcher stack.TransportDispatcher
+	nicID         tcpip.NICID
+	id            stack.NetworkEndpointID
+	prefixLen     int
+	linkEP        stack.LinkEndpoint
+	linkAddrCache stack.LinkAddressCache
+	dispatcher    stack.TransportDispatcher
+	protocol      *protocol
 }
 
-func newEndpoint(nicid tcpip.NICID, addr tcpip.Address, dispatcher stack.TransportDispatcher, linkEP stack.LinkEndpoint) *endpoint {
-	e := &endpoint{nicid: nicid, linkEP: linkEP, dispatcher: dispatcher}
-	copy(e.address[:], addr)
-	e.id = stack.NetworkEndpointID{tcpip.Address(e.address[:])}
-	return e
+// DefaultTTL is the default hop limit for this endpoint.
+func (e *endpoint) DefaultTTL() uint8 {
+	return e.protocol.DefaultTTL()
 }
 
 // MTU implements stack.NetworkEndpoint.MTU. It returns the link-layer MTU minus
@@ -54,12 +65,17 @@ func (e *endpoint) MTU() uint32 {
 
 // NICID returns the ID of the NIC this endpoint belongs to.
 func (e *endpoint) NICID() tcpip.NICID {
-	return e.nicid
+	return e.nicID
 }
 
 // ID returns the ipv6 endpoint ID.
 func (e *endpoint) ID() *stack.NetworkEndpointID {
 	return &e.id
+}
+
+// PrefixLen returns the ipv6 endpoint subnet prefix length in bits.
+func (e *endpoint) PrefixLen() int {
+	return e.prefixLen
 }
 
 // Capabilities implements stack.NetworkEndpoint.Capabilities.
@@ -73,55 +89,111 @@ func (e *endpoint) MaxHeaderLength() uint16 {
 	return e.linkEP.MaxHeaderLength() + header.IPv6MinimumSize
 }
 
-// WritePacket writes a packet to the given destination address and protocol.
-func (e *endpoint) WritePacket(r *stack.Route, hdr *buffer.Prependable, payload buffer.View, protocol tcpip.TransportProtocolNumber) *tcpip.Error {
-	length := uint16(hdr.UsedLength())
-	if payload != nil {
-		length += uint16(len(payload))
+// GSOMaxSize returns the maximum GSO packet size.
+func (e *endpoint) GSOMaxSize() uint32 {
+	if gso, ok := e.linkEP.(stack.GSOEndpoint); ok {
+		return gso.GSOMaxSize()
 	}
+	return 0
+}
+
+func (e *endpoint) addIPHeader(r *stack.Route, hdr *buffer.Prependable, payloadSize int, params stack.NetworkHeaderParams) header.IPv6 {
+	length := uint16(hdr.UsedLength() + payloadSize)
 	ip := header.IPv6(hdr.Prepend(header.IPv6MinimumSize))
 	ip.Encode(&header.IPv6Fields{
 		PayloadLength: length,
-		NextHeader:    uint8(protocol),
-		HopLimit:      65,
-		SrcAddr:       tcpip.Address(e.address[:]),
+		NextHeader:    uint8(params.Protocol),
+		HopLimit:      params.TTL,
+		TrafficClass:  params.TOS,
+		SrcAddr:       r.LocalAddress,
 		DstAddr:       r.RemoteAddress,
 	})
+	return ip
+}
 
-	return e.linkEP.WritePacket(r, hdr, payload, ProtocolNumber)
+// WritePacket writes a packet to the given destination address and protocol.
+func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.NetworkHeaderParams, loop stack.PacketLooping, pkt tcpip.PacketBuffer) *tcpip.Error {
+	ip := e.addIPHeader(r, &pkt.Header, pkt.Data.Size(), params)
+
+	if loop&stack.PacketLoop != 0 {
+		views := make([]buffer.View, 1, 1+len(pkt.Data.Views()))
+		views[0] = pkt.Header.View()
+		views = append(views, pkt.Data.Views()...)
+		loopedR := r.MakeLoopedRoute()
+
+		e.HandlePacket(&loopedR, tcpip.PacketBuffer{
+			Data:          buffer.NewVectorisedView(len(views[0])+pkt.Data.Size(), views),
+			NetworkHeader: buffer.View(ip),
+		})
+
+		loopedR.Release()
+	}
+	if loop&stack.PacketOut == 0 {
+		return nil
+	}
+
+	r.Stats().IP.PacketsSent.Increment()
+	return e.linkEP.WritePacket(r, gso, ProtocolNumber, pkt)
+}
+
+// WritePackets implements stack.LinkEndpoint.WritePackets.
+func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, hdrs []stack.PacketDescriptor, payload buffer.VectorisedView, params stack.NetworkHeaderParams, loop stack.PacketLooping) (int, *tcpip.Error) {
+	if loop&stack.PacketLoop != 0 {
+		panic("not implemented")
+	}
+	if loop&stack.PacketOut == 0 {
+		return len(hdrs), nil
+	}
+
+	for i := range hdrs {
+		hdr := &hdrs[i].Hdr
+		size := hdrs[i].Size
+		e.addIPHeader(r, hdr, size, params)
+	}
+
+	n, err := e.linkEP.WritePackets(r, gso, hdrs, payload, ProtocolNumber)
+	r.Stats().IP.PacketsSent.IncrementBy(uint64(n))
+	return n, err
+}
+
+// WriteHeaderIncludedPacker implements stack.NetworkEndpoint. It is not yet
+// supported by IPv6.
+func (*endpoint) WriteHeaderIncludedPacket(r *stack.Route, loop stack.PacketLooping, pkt tcpip.PacketBuffer) *tcpip.Error {
+	// TODO(b/119580726): Support IPv6 header-included packets.
+	return tcpip.ErrNotSupported
 }
 
 // HandlePacket is called by the link layer when new ipv6 packets arrive for
 // this endpoint.
-func (e *endpoint) HandlePacket(r *stack.Route, vv *buffer.VectorisedView) {
-	h := header.IPv6(vv.First())
-	if !h.IsValid(vv.Size()) {
+func (e *endpoint) HandlePacket(r *stack.Route, pkt tcpip.PacketBuffer) {
+	headerView := pkt.Data.First()
+	h := header.IPv6(headerView)
+	if !h.IsValid(pkt.Data.Size()) {
 		return
 	}
 
-	vv.TrimFront(header.IPv6MinimumSize)
-	vv.CapLength(int(h.PayloadLength()))
+	pkt.NetworkHeader = headerView[:header.IPv6MinimumSize]
+	pkt.Data.TrimFront(header.IPv6MinimumSize)
+	pkt.Data.CapLength(int(h.PayloadLength()))
 
 	p := h.TransportProtocol()
 	if p == header.ICMPv6ProtocolNumber {
-		e.handleICMP(r, vv)
+		e.handleICMP(r, headerView, pkt)
 		return
 	}
 
-	e.dispatcher.DeliverTransportPacket(r, p, vv)
+	r.Stats().IP.PacketsDelivered.Increment()
+	e.dispatcher.DeliverTransportPacket(r, p, pkt)
 }
 
 // Close cleans up resources associated with the endpoint.
 func (*endpoint) Close() {}
 
-type protocol struct{}
-
-// NewProtocol creates a new protocol ipv6 protocol descriptor. This is exported
-// only for tests that short-circuit the stack. Regular use of the protocol is
-// done via the stack, which gets a protocol descriptor from the init() function
-// below.
-func NewProtocol() stack.NetworkProtocol {
-	return &protocol{}
+type protocol struct {
+	// defaultTTL is the current default TTL for the protocol. Only the
+	// uint8 portion of it is meaningful and it must be accessed
+	// atomically.
+	defaultTTL uint32
 }
 
 // Number returns the ipv6 protocol number.
@@ -134,6 +206,11 @@ func (p *protocol) MinimumPacketSize() int {
 	return header.IPv6MinimumSize
 }
 
+// DefaultPrefixLen returns the IPv6 default prefix length.
+func (p *protocol) DefaultPrefixLen() int {
+	return header.IPv6AddressSize * 8
+}
+
 // ParseAddresses implements NetworkProtocol.ParseAddresses.
 func (*protocol) ParseAddresses(v buffer.View) (src, dst tcpip.Address) {
 	h := header.IPv6(v)
@@ -141,18 +218,48 @@ func (*protocol) ParseAddresses(v buffer.View) (src, dst tcpip.Address) {
 }
 
 // NewEndpoint creates a new ipv6 endpoint.
-func (p *protocol) NewEndpoint(nicid tcpip.NICID, addr tcpip.Address, linkAddrCache stack.LinkAddressCache, dispatcher stack.TransportDispatcher, linkEP stack.LinkEndpoint) (stack.NetworkEndpoint, *tcpip.Error) {
-	return newEndpoint(nicid, addr, dispatcher, linkEP), nil
+func (p *protocol) NewEndpoint(nicID tcpip.NICID, addrWithPrefix tcpip.AddressWithPrefix, linkAddrCache stack.LinkAddressCache, dispatcher stack.TransportDispatcher, linkEP stack.LinkEndpoint) (stack.NetworkEndpoint, *tcpip.Error) {
+	return &endpoint{
+		nicID:         nicID,
+		id:            stack.NetworkEndpointID{LocalAddress: addrWithPrefix.Address},
+		prefixLen:     addrWithPrefix.PrefixLen,
+		linkEP:        linkEP,
+		linkAddrCache: linkAddrCache,
+		dispatcher:    dispatcher,
+		protocol:      p,
+	}, nil
 }
 
 // SetOption implements NetworkProtocol.SetOption.
 func (p *protocol) SetOption(option interface{}) *tcpip.Error {
-	return tcpip.ErrUnknownProtocolOption
+	switch v := option.(type) {
+	case tcpip.DefaultTTLOption:
+		p.SetDefaultTTL(uint8(v))
+		return nil
+	default:
+		return tcpip.ErrUnknownProtocolOption
+	}
 }
 
 // Option implements NetworkProtocol.Option.
 func (p *protocol) Option(option interface{}) *tcpip.Error {
-	return tcpip.ErrUnknownProtocolOption
+	switch v := option.(type) {
+	case *tcpip.DefaultTTLOption:
+		*v = tcpip.DefaultTTLOption(p.DefaultTTL())
+		return nil
+	default:
+		return tcpip.ErrUnknownProtocolOption
+	}
+}
+
+// SetDefaultTTL sets the default TTL for endpoints created with this protocol.
+func (p *protocol) SetDefaultTTL(ttl uint8) {
+	atomic.StoreUint32(&p.defaultTTL, uint32(ttl))
+}
+
+// DefaultTTL returns the default TTL for endpoints created with this protocol.
+func (p *protocol) DefaultTTL() uint8 {
+	return uint8(atomic.LoadUint32(&p.defaultTTL))
 }
 
 // calculateMTU calculates the network-layer payload MTU based on the link-layer
@@ -165,8 +272,7 @@ func calculateMTU(mtu uint32) uint32 {
 	return maxPayloadSize
 }
 
-func init() {
-	stack.RegisterNetworkProtocolFactory(ProtocolName, func() stack.NetworkProtocol {
-		return &protocol{}
-	})
+// NewProtocol returns an IPv6 network protocol.
+func NewProtocol() stack.NetworkProtocol {
+	return &protocol{defaultTTL: DefaultTTL}
 }

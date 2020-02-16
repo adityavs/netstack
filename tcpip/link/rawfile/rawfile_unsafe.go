@@ -1,6 +1,18 @@
-// Copyright 2016 The Netstack Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// +build linux
 
 // Package rawfile contains utilities for using the netstack with raw host
 // files on Linux hosts.
@@ -11,10 +23,8 @@ import (
 	"unsafe"
 
 	"github.com/google/netstack/tcpip"
+	"golang.org/x/sys/unix"
 )
-
-//go:noescape
-func blockingPoll(fds unsafe.Pointer, nfds int, timeout int64) (n int, err syscall.Errno)
 
 // GetMTU determines the MTU of a network interface device.
 func GetMTU(name string) (uint32, error) {
@@ -56,9 +66,9 @@ func NonBlockingWrite(fd int, buf []byte) *tcpip.Error {
 	return nil
 }
 
-// NonBlockingWrite2 writes up to two byte slices to a file descriptor in a
+// NonBlockingWrite3 writes up to three byte slices to a file descriptor in a
 // single syscall. It fails if partial data is written.
-func NonBlockingWrite2(fd int, b1, b2 []byte) *tcpip.Error {
+func NonBlockingWrite3(fd int, b1, b2, b3 []byte) *tcpip.Error {
 	// If the is no second buffer, issue a regular write.
 	if len(b2) == 0 {
 		return NonBlockingWrite(fd, b1)
@@ -66,7 +76,7 @@ func NonBlockingWrite2(fd int, b1, b2 []byte) *tcpip.Error {
 
 	// We have two buffers. Build the iovec that represents them and issue
 	// a writev syscall.
-	iovec := [...]syscall.Iovec{
+	iovec := [3]syscall.Iovec{
 		{
 			Base: &b1[0],
 			Len:  uint64(len(b1)),
@@ -76,8 +86,15 @@ func NonBlockingWrite2(fd int, b1, b2 []byte) *tcpip.Error {
 			Len:  uint64(len(b2)),
 		},
 	}
+	iovecLen := uintptr(2)
 
-	_, _, e := syscall.RawSyscall(syscall.SYS_WRITEV, uintptr(fd), uintptr(unsafe.Pointer(&iovec[0])), uintptr(len(iovec)))
+	if len(b3) > 0 {
+		iovecLen++
+		iovec[2].Base = &b3[0]
+		iovec[2].Len = uint64(len(b3))
+	}
+
+	_, _, e := syscall.RawSyscall(syscall.SYS_WRITEV, uintptr(fd), uintptr(unsafe.Pointer(&iovec[0])), iovecLen)
 	if e != 0 {
 		return TranslateErrno(e)
 	}
@@ -85,32 +102,26 @@ func NonBlockingWrite2(fd int, b1, b2 []byte) *tcpip.Error {
 	return nil
 }
 
-// NonBlockingWriteN writes up to N byte slices to a file descriptor in a
-// single syscall. It fails if partial data is written.
-func NonBlockingWriteN(fd int, bs ...[]byte) *tcpip.Error {
-	iovec := make([]syscall.Iovec, 0, len(bs))
-
-	for _, b := range bs {
-		if len(b) == 0 {
-			continue
-		}
-		iovec = append(iovec, syscall.Iovec{
-			Base: &b[0],
-			Len:  uint64(len(b)),
-		})
-	}
-
-	_, _, e := syscall.RawSyscall(syscall.SYS_WRITEV, uintptr(fd), uintptr(unsafe.Pointer(&iovec[0])), uintptr(len(iovec)))
+// NonBlockingSendMMsg sends multiple messages on a socket.
+func NonBlockingSendMMsg(fd int, msgHdrs []MMsgHdr) (int, *tcpip.Error) {
+	n, _, e := syscall.RawSyscall6(unix.SYS_SENDMMSG, uintptr(fd), uintptr(unsafe.Pointer(&msgHdrs[0])), uintptr(len(msgHdrs)), syscall.MSG_DONTWAIT, 0, 0)
 	if e != 0 {
-		return TranslateErrno(e)
+		return 0, TranslateErrno(e)
 	}
 
-	return nil
+	return int(n), nil
+}
+
+// PollEvent represents the pollfd structure passed to a poll() system call.
+type PollEvent struct {
+	FD      int32
+	Events  int16
+	Revents int16
 }
 
 // BlockingRead reads from a file descriptor that is set up as non-blocking. If
 // no data is available, it will block in a poll() syscall until the file
-// descirptor becomes readable.
+// descriptor becomes readable.
 func BlockingRead(fd int, b []byte) (int, *tcpip.Error) {
 	for {
 		n, _, e := syscall.RawSyscall(syscall.SYS_READ, uintptr(fd), uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)))
@@ -118,16 +129,12 @@ func BlockingRead(fd int, b []byte) (int, *tcpip.Error) {
 			return int(n), nil
 		}
 
-		event := struct {
-			fd      int32
-			events  int16
-			revents int16
-		}{
-			fd:     int32(fd),
-			events: 1, // POLLIN
+		event := PollEvent{
+			FD:     int32(fd),
+			Events: 1, // POLLIN
 		}
 
-		_, e = blockingPoll(unsafe.Pointer(&event), 1, -1)
+		_, e = BlockingPoll(&event, 1, nil)
 		if e != 0 && e != syscall.EINTR {
 			return 0, TranslateErrno(e)
 		}
@@ -136,7 +143,7 @@ func BlockingRead(fd int, b []byte) (int, *tcpip.Error) {
 
 // BlockingReadv reads from a file descriptor that is set up as non-blocking and
 // stores the data in a list of iovecs buffers. If no data is available, it will
-// block in a poll() syscall until the file descirptor becomes readable.
+// block in a poll() syscall until the file descriptor becomes readable.
 func BlockingReadv(fd int, iovecs []syscall.Iovec) (int, *tcpip.Error) {
 	for {
 		n, _, e := syscall.RawSyscall(syscall.SYS_READV, uintptr(fd), uintptr(unsafe.Pointer(&iovecs[0])), uintptr(len(iovecs)))
@@ -144,17 +151,42 @@ func BlockingReadv(fd int, iovecs []syscall.Iovec) (int, *tcpip.Error) {
 			return int(n), nil
 		}
 
-		event := struct {
-			fd      int32
-			events  int16
-			revents int16
-		}{
-			fd:     int32(fd),
-			events: 1, // POLLIN
+		event := PollEvent{
+			FD:     int32(fd),
+			Events: 1, // POLLIN
 		}
 
-		_, e = blockingPoll(unsafe.Pointer(&event), 1, -1)
+		_, e = BlockingPoll(&event, 1, nil)
 		if e != 0 && e != syscall.EINTR {
+			return 0, TranslateErrno(e)
+		}
+	}
+}
+
+// MMsgHdr represents the mmsg_hdr structure required by recvmmsg() on linux.
+type MMsgHdr struct {
+	Msg syscall.Msghdr
+	Len uint32
+	_   [4]byte
+}
+
+// BlockingRecvMMsg reads from a file descriptor that is set up as non-blocking
+// and stores the received messages in a slice of MMsgHdr structures. If no data
+// is available, it will block in a poll() syscall until the file descriptor
+// becomes readable.
+func BlockingRecvMMsg(fd int, msgHdrs []MMsgHdr) (int, *tcpip.Error) {
+	for {
+		n, _, e := syscall.RawSyscall6(syscall.SYS_RECVMMSG, uintptr(fd), uintptr(unsafe.Pointer(&msgHdrs[0])), uintptr(len(msgHdrs)), syscall.MSG_DONTWAIT, 0, 0)
+		if e == 0 {
+			return int(n), nil
+		}
+
+		event := PollEvent{
+			FD:     int32(fd),
+			Events: 1, // POLLIN
+		}
+
+		if _, e := BlockingPoll(&event, 1, nil); e != 0 && e != syscall.EINTR {
 			return 0, TranslateErrno(e)
 		}
 	}

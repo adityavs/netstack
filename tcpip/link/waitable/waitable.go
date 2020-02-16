@@ -1,6 +1,16 @@
-// Copyright 2017 The Netstack Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 // Package waitable provides the implementation of data-link layer endpoints
 // that wrap other endpoints, and can wait for inflight calls to WritePacket or
@@ -30,23 +40,22 @@ type Endpoint struct {
 // New creates a new waitable link-layer endpoint. It wraps around another
 // endpoint and allows the caller to block new write/dispatch calls and wait for
 // the inflight ones to finish before returning.
-func New(lower tcpip.LinkEndpointID) (tcpip.LinkEndpointID, *Endpoint) {
-	e := &Endpoint{
-		lower: stack.FindLinkEndpoint(lower),
+func New(lower stack.LinkEndpoint) *Endpoint {
+	return &Endpoint{
+		lower: lower,
 	}
-	return stack.RegisterLinkEndpoint(e), e
 }
 
 // DeliverNetworkPacket implements stack.NetworkDispatcher.DeliverNetworkPacket.
 // It is called by the link-layer endpoint being wrapped when a packet arrives,
 // and only forwards to the actual dispatcher if Wait or WaitDispatch haven't
 // been called.
-func (e *Endpoint) DeliverNetworkPacket(linkEP stack.LinkEndpoint, remoteLinkAddr tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, vv *buffer.VectorisedView) {
+func (e *Endpoint) DeliverNetworkPacket(linkEP stack.LinkEndpoint, remote, local tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt tcpip.PacketBuffer) {
 	if !e.dispatchGate.Enter() {
 		return
 	}
 
-	e.dispatcher.DeliverNetworkPacket(e, remoteLinkAddr, protocol, vv)
+	e.dispatcher.DeliverNetworkPacket(e, remote, local, protocol, pkt)
 	e.dispatchGate.Leave()
 }
 
@@ -56,6 +65,11 @@ func (e *Endpoint) DeliverNetworkPacket(linkEP stack.LinkEndpoint, remoteLinkAdd
 func (e *Endpoint) Attach(dispatcher stack.NetworkDispatcher) {
 	e.dispatcher = dispatcher
 	e.lower.Attach(e)
+}
+
+// IsAttached implements stack.LinkEndpoint.IsAttached.
+func (e *Endpoint) IsAttached() bool {
+	return e.dispatcher != nil
 }
 
 // MTU implements stack.LinkEndpoint.MTU. It just forwards the request to the
@@ -85,12 +99,36 @@ func (e *Endpoint) LinkAddress() tcpip.LinkAddress {
 // WritePacket implements stack.LinkEndpoint.WritePacket. It is called by
 // higher-level protocols to write packets. It only forwards packets to the
 // lower endpoint if Wait or WaitWrite haven't been called.
-func (e *Endpoint) WritePacket(r *stack.Route, hdr *buffer.Prependable, payload buffer.View, protocol tcpip.NetworkProtocolNumber) *tcpip.Error {
+func (e *Endpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt tcpip.PacketBuffer) *tcpip.Error {
 	if !e.writeGate.Enter() {
 		return nil
 	}
 
-	err := e.lower.WritePacket(r, hdr, payload, protocol)
+	err := e.lower.WritePacket(r, gso, protocol, pkt)
+	e.writeGate.Leave()
+	return err
+}
+
+// WritePackets implements stack.LinkEndpoint.WritePackets. It is called by
+// higher-level protocols to write packets. It only forwards packets to the
+// lower endpoint if Wait or WaitWrite haven't been called.
+func (e *Endpoint) WritePackets(r *stack.Route, gso *stack.GSO, hdrs []stack.PacketDescriptor, payload buffer.VectorisedView, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
+	if !e.writeGate.Enter() {
+		return len(hdrs), nil
+	}
+
+	n, err := e.lower.WritePackets(r, gso, hdrs, payload, protocol)
+	e.writeGate.Leave()
+	return n, err
+}
+
+// WriteRawPacket implements stack.LinkEndpoint.WriteRawPacket.
+func (e *Endpoint) WriteRawPacket(vv buffer.VectorisedView) *tcpip.Error {
+	if !e.writeGate.Enter() {
+		return nil
+	}
+
+	err := e.lower.WriteRawPacket(vv)
 	e.writeGate.Leave()
 	return err
 }
@@ -106,3 +144,6 @@ func (e *Endpoint) WaitWrite() {
 func (e *Endpoint) WaitDispatch() {
 	e.dispatchGate.Close()
 }
+
+// Wait implements stack.LinkEndpoint.Wait.
+func (e *Endpoint) Wait() {}

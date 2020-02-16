@@ -1,6 +1,16 @@
-// Copyright 2016 The Netstack Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package header
 
@@ -11,16 +21,18 @@ import (
 )
 
 const (
-	versIHL  = 0
-	tos      = 1
-	totalLen = 2
-	id       = 4
-	flagsFO  = 6
-	ttl      = 8
-	protocol = 9
-	checksum = 10
-	srcAddr  = 12
-	dstAddr  = 16
+	versIHL = 0
+	tos     = 1
+	// IPv4TotalLenOffset is the offset of the total length field in the
+	// IPv4 header.
+	IPv4TotalLenOffset = 2
+	id                 = 4
+	flagsFO            = 6
+	ttl                = 8
+	protocol           = 9
+	checksum           = 10
+	srcAddr            = 12
+	dstAddr            = 16
 )
 
 // IPv4Fields contains the fields of an IPv4 packet. It is used to describe the
@@ -75,14 +87,29 @@ const (
 	// units, the header cannot exceed 15*4 = 60 bytes.
 	IPv4MaximumHeaderSize = 60
 
+	// MinIPFragmentPayloadSize is the minimum number of payload bytes that
+	// the first fragment must carry when an IPv4 packet is fragmented.
+	MinIPFragmentPayloadSize = 8
+
 	// IPv4AddressSize is the size, in bytes, of an IPv4 address.
 	IPv4AddressSize = 4
 
 	// IPv4ProtocolNumber is IPv4's network protocol number.
 	IPv4ProtocolNumber tcpip.NetworkProtocolNumber = 0x0800
 
-	// IPv4Version is the version of the ipv4 procotol.
+	// IPv4Version is the version of the ipv4 protocol.
 	IPv4Version = 4
+
+	// IPv4Broadcast is the broadcast address of the IPv4 procotol.
+	IPv4Broadcast tcpip.Address = "\xff\xff\xff\xff"
+
+	// IPv4Any is the non-routable IPv4 "any" meta address.
+	IPv4Any tcpip.Address = "\x00\x00\x00\x00"
+
+	// IPv4MinimumProcessableDatagramSize is the minimum size of an IP
+	// packet that every IPv4 capable host must be able to
+	// process/reassemble.
+	IPv4MinimumProcessableDatagramSize = 576
 )
 
 // Flags that may be set in an IPv4 packet.
@@ -90,6 +117,15 @@ const (
 	IPv4FlagMoreFragments = 1 << iota
 	IPv4FlagDontFragment
 )
+
+// IPv4EmptySubnet is the empty IPv4 subnet.
+var IPv4EmptySubnet = func() tcpip.Subnet {
+	subnet, err := tcpip.NewSubnet(IPv4Any, tcpip.AddressMask(IPv4Any))
+	if err != nil {
+		panic(err)
+	}
+	return subnet
+}()
 
 // IPVersion returns the version of IP used in the given packet. It returns -1
 // if the packet is not large enough to contain the version field.
@@ -134,7 +170,7 @@ func (b IPv4) FragmentOffset() uint16 {
 
 // TotalLength returns the "total length" field of the ipv4 header.
 func (b IPv4) TotalLength() uint16 {
-	return binary.BigEndian.Uint16(b[totalLen:])
+	return binary.BigEndian.Uint16(b[IPv4TotalLenOffset:])
 }
 
 // Checksum returns the checksum field of the ipv4 header.
@@ -180,7 +216,7 @@ func (b IPv4) SetTOS(v uint8, _ uint32) {
 
 // SetTotalLength sets the "total length" field of the ipv4 header.
 func (b IPv4) SetTotalLength(totalLength uint16) {
-	binary.BigEndian.PutUint16(b[totalLen:], totalLength)
+	binary.BigEndian.PutUint16(b[IPv4TotalLenOffset:], totalLength)
 }
 
 // SetChecksum sets the checksum field of the ipv4 header.
@@ -193,6 +229,11 @@ func (b IPv4) SetChecksum(v uint16) {
 func (b IPv4) SetFlagsFragmentOffset(flags uint8, offset uint16) {
 	v := (uint16(flags) << 13) | (offset >> 3)
 	binary.BigEndian.PutUint16(b[flagsFO:], v)
+}
+
+// SetID sets the identification field.
+func (b IPv4) SetID(v uint16) {
+	binary.BigEndian.PutUint16(b[id:], v)
 }
 
 // SetSourceAddress sets the "source address" field of the ipv4 header.
@@ -231,7 +272,7 @@ func (b IPv4) Encode(i *IPv4Fields) {
 // packets are produced.
 func (b IPv4) EncodePartial(partialChecksum, totalLength uint16) {
 	b.SetTotalLength(totalLength)
-	checksum := Checksum(b[totalLen:totalLen+2], partialChecksum)
+	checksum := Checksum(b[IPv4TotalLenOffset:IPv4TotalLenOffset+2], partialChecksum)
 	b.SetChecksum(^checksum)
 }
 
@@ -243,9 +284,23 @@ func (b IPv4) IsValid(pktSize int) bool {
 
 	hlen := int(b.HeaderLength())
 	tlen := int(b.TotalLength())
-	if hlen > tlen || tlen > pktSize {
+	if hlen < IPv4MinimumSize || hlen > tlen || tlen > pktSize {
+		return false
+	}
+
+	if IPVersion(b) != IPv4Version {
 		return false
 	}
 
 	return true
+}
+
+// IsV4MulticastAddress determines if the provided address is an IPv4 multicast
+// address (range 224.0.0.0 to 239.255.255.255). The four most significant bits
+// will be 1110 = 0xe0.
+func IsV4MulticastAddress(addr tcpip.Address) bool {
+	if len(addr) != IPv4AddressSize {
+		return false
+	}
+	return (addr[0] & 0xf0) == 0xe0
 }

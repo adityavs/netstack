@@ -1,6 +1,16 @@
-// Copyright 2016 The Netstack Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package tcp_test
 
@@ -95,7 +105,7 @@ func TestTimeStampEnabledConnect(t *testing.T) {
 	// There should be 5 views to read and each of them should
 	// contain the same data.
 	for i := 0; i < 5; i++ {
-		got, err := c.EP.Read(nil)
+		got, _, err := c.EP.Read(nil)
 		if err != nil {
 			t.Fatalf("Unexpected error from Read: %v", err)
 		}
@@ -137,7 +147,7 @@ func timeStampEnabledAccept(t *testing.T, cookieEnabled bool, wndScale int, wndS
 	view := buffer.NewView(len(data))
 	copy(view, data)
 
-	if _, err := c.EP.Write(tcpip.SlicePayload(view), tcpip.WriteOptions{}); err != nil {
+	if _, _, err := c.EP.Write(tcpip.SlicePayload(view), tcpip.WriteOptions{}); err != nil {
 		t.Fatalf("Unexpected error from Write: %v", err)
 	}
 
@@ -172,7 +182,7 @@ func TestTimeStampEnabledAccept(t *testing.T) {
 		wndSize       uint16
 	}{
 		{true, -1, 0xffff}, // When cookie is used window scaling is disabled.
-		{false, 5, 0x8000}, // 0x8000 * 2^5 = 1<<20 = 1MB window (the default).
+		{false, 5, 0x8000}, // DefaultReceiveBufferSize is 1MB >> 5.
 	}
 	for _, tc := range testCases {
 		timeStampEnabledAccept(t, tc.cookieEnabled, tc.wndScale, tc.wndSize)
@@ -200,7 +210,7 @@ func timeStampDisabledAccept(t *testing.T, cookieEnabled bool, wndScale int, wnd
 	view := buffer.NewView(len(data))
 	copy(view, data)
 
-	if _, err := c.EP.Write(tcpip.SlicePayload(view), tcpip.WriteOptions{}); err != nil {
+	if _, _, err := c.EP.Write(tcpip.SlicePayload(view), tcpip.WriteOptions{}); err != nil {
 		t.Fatalf("Unexpected error from Write: %v", err)
 	}
 
@@ -229,7 +239,7 @@ func TestTimeStampDisabledAccept(t *testing.T) {
 		wndSize       uint16
 	}{
 		{true, -1, 0xffff}, // When cookie is used window scaling is disabled.
-		{false, 5, 0x8000}, // 0x8000 * 2^5 = 1<<20 = 1MB window (the default).
+		{false, 5, 0x8000}, // DefaultReceiveBufferSize is 1MB >> 5.
 	}
 	for _, tc := range testCases {
 		timeStampDisabledAccept(t, tc.cookieEnabled, tc.wndScale, tc.wndSize)
@@ -245,7 +255,7 @@ func TestSendGreaterThanMTUWithOptions(t *testing.T) {
 	testBrokenUpWrite(t, c, maxPayload)
 }
 
-func TestSegmentDropWhenTimestampMissing(t *testing.T) {
+func TestSegmentNotDroppedWhenTimestampMissing(t *testing.T) {
 	const maxPayload = 100
 	c := context.New(t, uint32(header.TCPMinimumSize+header.IPv4MinimumSize+maxPayload))
 	defer c.Cleanup()
@@ -257,32 +267,11 @@ func TestSegmentDropWhenTimestampMissing(t *testing.T) {
 	c.WQ.EventRegister(&we, waiter.EventIn)
 	defer c.WQ.EventUnregister(&we)
 
-	stk := c.Stack()
-	droppedPackets := stk.Stats().DroppedPackets
+	droppedPacketsStat := c.Stack().Stats().DroppedPackets
+	droppedPackets := droppedPacketsStat.Value()
 	data := []byte{1, 2, 3}
-	// Save the sequence number as we will reset it later down
-	// in the test.
-	savedSeqNum := rep.NextSeqNum
+	// Send a packet with no TCP options/timestamp.
 	rep.SendPacket(data, nil)
-
-	select {
-	case <-ch:
-		t.Fatalf("Got data to read when we expect packet to be dropped")
-	case <-time.After(1 * time.Second):
-		// We expect that no data will be available to read.
-	}
-
-	// Assert that DroppedPackets was incremented by 1.
-	if got, want := stk.Stats().DroppedPackets, droppedPackets+1; got != want {
-		t.Fatalf("incorrect number of dropped packets, got: %v, want: %v", got, want)
-	}
-
-	droppedPackets = stk.Stats().DroppedPackets
-	// Reset the sequence number so that the other endpoint accepts
-	// this segment and does not treat it like an out of order delivery.
-	rep.NextSeqNum = savedSeqNum
-	// Now send a packet with timestamp and we should get the data.
-	rep.SendPacketWithTS(data, rep.TSVal+1)
 
 	select {
 	case <-ch:
@@ -290,13 +279,13 @@ func TestSegmentDropWhenTimestampMissing(t *testing.T) {
 		t.Fatalf("Timed out waiting for data to arrive")
 	}
 
-	// Assert that DroppedPackets was not incremented by 1.
-	if got, want := stk.Stats().DroppedPackets, droppedPackets; got != want {
+	// Assert that DroppedPackets was not incremented.
+	if got, want := droppedPacketsStat.Value(), droppedPackets; got != want {
 		t.Fatalf("incorrect number of dropped packets, got: %v, want: %v", got, want)
 	}
 
 	// Issue a read and we should data.
-	got, err := c.EP.Read(nil)
+	got, _, err := c.EP.Read(nil)
 	if err != nil {
 		t.Fatalf("Unexpected error from Read: %v", err)
 	}

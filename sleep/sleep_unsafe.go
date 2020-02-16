@@ -1,6 +1,21 @@
-// Copyright 2016 The Netstack Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// +build go1.11
+// +build !go1.15
+
+// Check go:linkname function signatures when updating Go version.
 
 // Package sleep allows goroutines to efficiently sleep on multiple sources of
 // notifications (wakers). It offers O(1) complexity, which is different from
@@ -75,7 +90,7 @@ var (
 )
 
 //go:linkname gopark runtime.gopark
-func gopark(unlockf func(uintptr, *uintptr) bool, wg *uintptr, reason string, traceEv byte, traceskip int)
+func gopark(unlockf func(uintptr, *uintptr) bool, wg *uintptr, reason uint8, traceEv byte, traceskip int)
 
 //go:linkname goready runtime.goready
 func goready(g uintptr, traceskip int)
@@ -169,7 +184,10 @@ func (s *Sleeper) nextWaker(block bool) *Waker {
 			// commitSleep to decide whether to immediately
 			// wake the caller up or to leave it sleeping.
 			const traceEvGoBlockSelect = 24
-			gopark(commitSleep, &s.waitingG, "sleeper", traceEvGoBlockSelect, 0)
+			// See:runtime2.go in the go runtime package for
+			// the values to pass as the waitReason here.
+			const waitReasonSelect = 9
+			gopark(commitSleep, &s.waitingG, waitReasonSelect, traceEvGoBlockSelect, 0)
 		}
 
 		// Pull the shared list out and reverse it in the local

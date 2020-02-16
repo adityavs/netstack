@@ -1,6 +1,16 @@
-// Copyright 2016 The Netstack Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package stack
 
@@ -36,16 +46,30 @@ type Route struct {
 	// ref a reference to the network endpoint through which the route
 	// starts.
 	ref *referencedNetworkEndpoint
+
+	// Loop controls where WritePacket should send packets.
+	Loop PacketLooping
 }
 
 // makeRoute initializes a new route. It takes ownership of the provided
 // reference to a network endpoint.
-func makeRoute(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr tcpip.Address, ref *referencedNetworkEndpoint) Route {
+func makeRoute(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr tcpip.Address, localLinkAddr tcpip.LinkAddress, ref *referencedNetworkEndpoint, handleLocal, multicastLoop bool) Route {
+	loop := PacketOut
+	if handleLocal && localAddr != "" && remoteAddr == localAddr {
+		loop = PacketLoop
+	} else if multicastLoop && (header.IsV4MulticastAddress(remoteAddr) || header.IsV6MulticastAddress(remoteAddr)) {
+		loop |= PacketLoop
+	} else if remoteAddr == header.IPv4Broadcast {
+		loop |= PacketLoop
+	}
+
 	return Route{
-		NetProto:      netProto,
-		LocalAddress:  localAddr,
-		RemoteAddress: remoteAddr,
-		ref:           ref,
+		NetProto:         netProto,
+		LocalAddress:     localAddr,
+		LocalLinkAddress: localLinkAddr,
+		RemoteAddress:    remoteAddr,
+		ref:              ref,
+		Loop:             loop,
 	}
 }
 
@@ -59,10 +83,15 @@ func (r *Route) MaxHeaderLength() uint16 {
 	return r.ref.ep.MaxHeaderLength()
 }
 
+// Stats returns a mutable copy of current stats.
+func (r *Route) Stats() tcpip.Stats {
+	return r.ref.nic.stack.Stats()
+}
+
 // PseudoHeaderChecksum forwards the call to the network endpoint's
 // implementation.
-func (r *Route) PseudoHeaderChecksum(protocol tcpip.TransportProtocolNumber) uint16 {
-	return header.PseudoHeaderChecksum(protocol, r.LocalAddress, r.RemoteAddress)
+func (r *Route) PseudoHeaderChecksum(protocol tcpip.TransportProtocolNumber, totalLen uint16) uint16 {
+	return header.PseudoHeaderChecksum(protocol, r.LocalAddress, r.RemoteAddress, totalLen)
 }
 
 // Capabilities returns the link-layer capabilities of the route.
@@ -70,26 +99,43 @@ func (r *Route) Capabilities() LinkEndpointCapabilities {
 	return r.ref.ep.Capabilities()
 }
 
+// GSOMaxSize returns the maximum GSO packet size.
+func (r *Route) GSOMaxSize() uint32 {
+	if gso, ok := r.ref.ep.(GSOEndpoint); ok {
+		return gso.GSOMaxSize()
+	}
+	return 0
+}
+
 // Resolve attempts to resolve the link address if necessary. Returns ErrWouldBlock in
 // case address resolution requires blocking, e.g. wait for ARP reply. Waker is
 // notified when address resolution is complete (success or not).
-func (r *Route) Resolve(waker *sleep.Waker) *tcpip.Error {
+//
+// If address resolution is required, ErrNoLinkAddress and a notification channel is
+// returned for the top level caller to block. Channel is closed once address resolution
+// is complete (success or not).
+func (r *Route) Resolve(waker *sleep.Waker) (<-chan struct{}, *tcpip.Error) {
 	if !r.IsResolutionRequired() {
 		// Nothing to do if there is no cache (which does the resolution on cache miss) or
 		// link address is already known.
-		return nil
+		return nil, nil
 	}
 
 	nextAddr := r.NextHop
 	if nextAddr == "" {
+		// Local link address is already known.
+		if r.RemoteAddress == r.LocalAddress {
+			r.RemoteLinkAddress = r.LocalLinkAddress
+			return nil, nil
+		}
 		nextAddr = r.RemoteAddress
 	}
-	linkAddr, err := r.ref.linkCache.GetLinkAddress(r.ref.nic.ID(), nextAddr, r.LocalAddress, r.NetProto, waker)
+	linkAddr, ch, err := r.ref.linkCache.GetLinkAddress(r.ref.nic.ID(), nextAddr, r.LocalAddress, r.NetProto, waker)
 	if err != nil {
-		return err
+		return ch, err
 	}
 	r.RemoteLinkAddress = linkAddr
-	return nil
+	return nil, nil
 }
 
 // RemoveWaker removes a waker that has been added in Resolve().
@@ -104,12 +150,82 @@ func (r *Route) RemoveWaker(waker *sleep.Waker) {
 // IsResolutionRequired returns true if Resolve() must be called to resolve
 // the link address before the this route can be written to.
 func (r *Route) IsResolutionRequired() bool {
-	return r.ref.linkCache != nil && r.RemoteLinkAddress == ""
+	return r.ref.isValidForOutgoing() && r.ref.linkCache != nil && r.RemoteLinkAddress == ""
 }
 
 // WritePacket writes the packet through the given route.
-func (r *Route) WritePacket(hdr *buffer.Prependable, payload buffer.View, protocol tcpip.TransportProtocolNumber) *tcpip.Error {
-	return r.ref.ep.WritePacket(r, hdr, payload, protocol)
+func (r *Route) WritePacket(gso *GSO, params NetworkHeaderParams, pkt tcpip.PacketBuffer) *tcpip.Error {
+	if !r.ref.isValidForOutgoing() {
+		return tcpip.ErrInvalidEndpointState
+	}
+
+	err := r.ref.ep.WritePacket(r, gso, params, r.Loop, pkt)
+	if err != nil {
+		r.Stats().IP.OutgoingPacketErrors.Increment()
+	} else {
+		r.ref.nic.stats.Tx.Packets.Increment()
+		r.ref.nic.stats.Tx.Bytes.IncrementBy(uint64(pkt.Header.UsedLength() + pkt.Data.Size()))
+	}
+	return err
+}
+
+// PacketDescriptor is a packet descriptor which contains a packet header and
+// offset and size of packet data in a payload view.
+type PacketDescriptor struct {
+	Hdr  buffer.Prependable
+	Off  int
+	Size int
+}
+
+// NewPacketDescriptors allocates a set of packet descriptors.
+func NewPacketDescriptors(n int, hdrSize int) []PacketDescriptor {
+	buf := make([]byte, n*hdrSize)
+	hdrs := make([]PacketDescriptor, n)
+	for i := range hdrs {
+		hdrs[i].Hdr = buffer.NewEmptyPrependableFromView(buf[i*hdrSize:][:hdrSize])
+	}
+	return hdrs
+}
+
+// WritePackets writes the set of packets through the given route.
+func (r *Route) WritePackets(gso *GSO, hdrs []PacketDescriptor, payload buffer.VectorisedView, params NetworkHeaderParams) (int, *tcpip.Error) {
+	if !r.ref.isValidForOutgoing() {
+		return 0, tcpip.ErrInvalidEndpointState
+	}
+
+	n, err := r.ref.ep.WritePackets(r, gso, hdrs, payload, params, r.Loop)
+	if err != nil {
+		r.Stats().IP.OutgoingPacketErrors.IncrementBy(uint64(len(hdrs) - n))
+	}
+	r.ref.nic.stats.Tx.Packets.IncrementBy(uint64(n))
+	payloadSize := 0
+	for i := 0; i < n; i++ {
+		r.ref.nic.stats.Tx.Bytes.IncrementBy(uint64(hdrs[i].Hdr.UsedLength()))
+		payloadSize += hdrs[i].Size
+	}
+	r.ref.nic.stats.Tx.Bytes.IncrementBy(uint64(payloadSize))
+	return n, err
+}
+
+// WriteHeaderIncludedPacket writes a packet already containing a network
+// header through the given route.
+func (r *Route) WriteHeaderIncludedPacket(pkt tcpip.PacketBuffer) *tcpip.Error {
+	if !r.ref.isValidForOutgoing() {
+		return tcpip.ErrInvalidEndpointState
+	}
+
+	if err := r.ref.ep.WriteHeaderIncludedPacket(r, r.Loop, pkt); err != nil {
+		r.Stats().IP.OutgoingPacketErrors.Increment()
+		return err
+	}
+	r.ref.nic.stats.Tx.Packets.Increment()
+	r.ref.nic.stats.Tx.Bytes.IncrementBy(uint64(pkt.Data.Size()))
+	return nil
+}
+
+// DefaultTTL returns the default TTL of the underlying network endpoint.
+func (r *Route) DefaultTTL() uint8 {
+	return r.ref.ep.DefaultTTL()
 }
 
 // MTU returns the MTU of the underlying network endpoint.
@@ -130,4 +246,26 @@ func (r *Route) Release() {
 func (r *Route) Clone() Route {
 	r.ref.incRef()
 	return *r
+}
+
+// MakeLoopedRoute duplicates the given route with special handling for routes
+// used for sending multicast or broadcast packets. In those cases the
+// multicast/broadcast address is the remote address when sending out, but for
+// incoming (looped) packets it becomes the local address. Similarly, the local
+// interface address that was the local address going out becomes the remote
+// address coming in. This is different to unicast routes where local and
+// remote addresses remain the same as they identify location (local vs remote)
+// not direction (source vs destination).
+func (r *Route) MakeLoopedRoute() Route {
+	l := r.Clone()
+	if r.RemoteAddress == header.IPv4Broadcast || header.IsV4MulticastAddress(r.RemoteAddress) || header.IsV6MulticastAddress(r.RemoteAddress) {
+		l.RemoteAddress, l.LocalAddress = l.LocalAddress, l.RemoteAddress
+		l.RemoteLinkAddress = l.LocalLinkAddress
+	}
+	return l
+}
+
+// Stack returns the instance of the Stack that owns this route.
+func (r *Route) Stack() *Stack {
+	return r.ref.stack()
 }

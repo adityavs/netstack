@@ -1,10 +1,21 @@
-// Copyright 2016 The Netstack Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package arp_test
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -16,6 +27,7 @@ import (
 	"github.com/google/netstack/tcpip/network/arp"
 	"github.com/google/netstack/tcpip/network/ipv4"
 	"github.com/google/netstack/tcpip/stack"
+	"github.com/google/netstack/tcpip/transport/icmp"
 )
 
 const (
@@ -32,14 +44,19 @@ type testContext struct {
 }
 
 func newTestContext(t *testing.T) *testContext {
-	s := stack.New([]string{ipv4.ProtocolName, arp.ProtocolName}, []string{ipv4.PingProtocolName})
+	s := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocol{ipv4.NewProtocol(), arp.NewProtocol()},
+		TransportProtocols: []stack.TransportProtocol{icmp.NewProtocol4()},
+	})
 
 	const defaultMTU = 65536
-	id, linkEP := channel.New(256, defaultMTU, stackLinkAddr)
+	ep := channel.New(256, defaultMTU, stackLinkAddr)
+	wep := stack.LinkEndpoint(ep)
+
 	if testing.Verbose() {
-		id = sniffer.New(id)
+		wep = sniffer.New(ep)
 	}
-	if err := s.CreateNIC(1, id); err != nil {
+	if err := s.CreateNIC(1, wep); err != nil {
 		t.Fatalf("CreateNIC failed: %v", err)
 	}
 
@@ -54,16 +71,14 @@ func newTestContext(t *testing.T) *testContext {
 	}
 
 	s.SetRouteTable([]tcpip.Route{{
-		Destination: "\x00\x00\x00\x00",
-		Mask:        "\x00\x00\x00\x00",
-		Gateway:     "",
+		Destination: header.IPv4EmptySubnet,
 		NIC:         1,
 	}})
 
 	return &testContext{
 		t:      t,
 		s:      s,
-		linkEP: linkEP,
+		linkEP: ep,
 	}
 }
 
@@ -85,54 +100,46 @@ func TestDirectRequest(t *testing.T) {
 	copy(h.HardwareAddressSender(), senderMAC)
 	copy(h.ProtocolAddressSender(), senderIPv4)
 
-	// stackAddr1
-	copy(h.ProtocolAddressTarget(), stackAddr1)
-	vv := v.ToVectorisedView([1]buffer.View{})
-	c.linkEP.Inject(arp.ProtocolNumber, &vv)
-	pkt := <-c.linkEP.C
-	if pkt.Proto != arp.ProtocolNumber {
-		t.Fatalf("stackAddr1: expected ARP response, got network protocol number %v", pkt.Proto)
-	}
-	rep := header.ARP(pkt.Header)
-	if !rep.IsValid() {
-		t.Fatalf("stackAddr1: invalid ARP response len(pkt.Header)=%d", len(pkt.Header))
-	}
-	if tcpip.Address(rep.ProtocolAddressSender()) != stackAddr1 {
-		t.Errorf("stackAddr1: expected sender to be set")
-	}
-	if got := tcpip.LinkAddress(rep.HardwareAddressSender()); got != stackLinkAddr {
-		t.Errorf("stackAddr1: expected sender to be stackLinkAddr, got %q", got)
+	inject := func(addr tcpip.Address) {
+		copy(h.ProtocolAddressTarget(), addr)
+		c.linkEP.InjectInbound(arp.ProtocolNumber, tcpip.PacketBuffer{
+			Data: v.ToVectorisedView(),
+		})
 	}
 
-	// stackAddr2
-	copy(h.ProtocolAddressTarget(), stackAddr2)
-	vv = v.ToVectorisedView([1]buffer.View{})
-	c.linkEP.Inject(arp.ProtocolNumber, &vv)
-	pkt = <-c.linkEP.C
-	if pkt.Proto != arp.ProtocolNumber {
-		t.Fatalf("stackAddr2: expected ARP response, got network protocol number %v", pkt.Proto)
-	}
-	rep = header.ARP(pkt.Header)
-	if !rep.IsValid() {
-		t.Fatalf("stackAddr2: invalid ARP response len(pkt.Header)=%d", len(pkt.Header))
-	}
-	if tcpip.Address(rep.ProtocolAddressSender()) != stackAddr2 {
-		t.Errorf("stackAddr2: expected sender to be set")
-	}
-	if got := tcpip.LinkAddress(rep.HardwareAddressSender()); got != stackLinkAddr {
-		t.Errorf("stackAddr2: expected sender to be stackLinkAddr, got %q", got)
+	for i, address := range []tcpip.Address{stackAddr1, stackAddr2} {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			inject(address)
+			pi := <-c.linkEP.C
+			if pi.Proto != arp.ProtocolNumber {
+				t.Fatalf("expected ARP response, got network protocol number %d", pi.Proto)
+			}
+			rep := header.ARP(pi.Pkt.Header.View())
+			if !rep.IsValid() {
+				t.Fatalf("invalid ARP response pi.Pkt.Header.UsedLength()=%d", pi.Pkt.Header.UsedLength())
+			}
+			if got, want := tcpip.LinkAddress(rep.HardwareAddressSender()), stackLinkAddr; got != want {
+				t.Errorf("got HardwareAddressSender = %s, want = %s", got, want)
+			}
+			if got, want := tcpip.Address(rep.ProtocolAddressSender()), tcpip.Address(h.ProtocolAddressTarget()); got != want {
+				t.Errorf("got ProtocolAddressSender = %s, want = %s", got, want)
+			}
+			if got, want := tcpip.LinkAddress(rep.HardwareAddressTarget()), tcpip.LinkAddress(h.HardwareAddressSender()); got != want {
+				t.Errorf("got HardwareAddressTarget = %s, want = %s", got, want)
+			}
+			if got, want := tcpip.Address(rep.ProtocolAddressTarget()), tcpip.Address(h.ProtocolAddressSender()); got != want {
+				t.Errorf("got ProtocolAddressTarget = %s, want = %s", got, want)
+			}
+		})
 	}
 
-	// stackAddrBad
-	copy(h.ProtocolAddressTarget(), stackAddrBad)
-	vv = v.ToVectorisedView([1]buffer.View{})
-	c.linkEP.Inject(arp.ProtocolNumber, &vv)
+	inject(stackAddrBad)
 	select {
 	case pkt := <-c.linkEP.C:
 		t.Errorf("stackAddrBad: unexpected packet sent, Proto=%v", pkt.Proto)
 	case <-time.After(100 * time.Millisecond):
-		// Sleep tests are gross, but this will only
-		// potentially fail flakily if there's a bugj
-		// If there is no bug this will reliably succeed.
+		// Sleep tests are gross, but this will only potentially flake
+		// if there's a bug. If there is no bug this will reliably
+		// succeed.
 	}
 }

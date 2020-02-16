@@ -1,6 +1,18 @@
-// Copyright 2016 The Netstack Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// +build linux
 
 // This sample creates a stack with TCP and IPv4 protocols on top of a TUN
 // device, and connects to a peer. Similar to "nc <address> <port>". While the
@@ -40,6 +52,7 @@ import (
 
 	"github.com/google/netstack/tcpip"
 	"github.com/google/netstack/tcpip/buffer"
+	"github.com/google/netstack/tcpip/header"
 	"github.com/google/netstack/tcpip/link/fdbased"
 	"github.com/google/netstack/tcpip/link/rawfile"
 	"github.com/google/netstack/tcpip/link/sniffer"
@@ -68,7 +81,7 @@ func writer(ch chan struct{}, ep tcpip.Endpoint) {
 
 		v.CapLength(n)
 		for len(v) > 0 {
-			n, err := ep.Write(tcpip.SlicePayload(v), tcpip.WriteOptions{})
+			n, _, err := ep.Write(tcpip.SlicePayload(v), tcpip.WriteOptions{})
 			if err != nil {
 				fmt.Println("Write failed:", err)
 				return
@@ -113,7 +126,10 @@ func main() {
 
 	// Create the stack with ipv4 and tcp protocols, then add a tun-based
 	// NIC and ipv4 address.
-	s := stack.New([]string{ipv4.ProtocolName}, []string{tcp.ProtocolName})
+	s := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocol{ipv4.NewProtocol()},
+		TransportProtocols: []stack.TransportProtocol{tcp.NewProtocol()},
+	})
 
 	mtu, err := rawfile.GetMTU(tunName)
 	if err != nil {
@@ -125,8 +141,11 @@ func main() {
 		log.Fatal(err)
 	}
 
-	linkID := fdbased.New(&fdbased.Options{FD: fd, MTU: mtu})
-	if err := s.CreateNIC(1, sniffer.New(linkID)); err != nil {
+	linkEP, err := fdbased.New(&fdbased.Options{FDs: []int{fd}, MTU: mtu})
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := s.CreateNIC(1, sniffer.New(linkEP)); err != nil {
 		log.Fatal(err)
 	}
 
@@ -137,9 +156,7 @@ func main() {
 	// Add default route.
 	s.SetRouteTable([]tcpip.Route{
 		{
-			Destination: "\x00\x00\x00\x00",
-			Mask:        "\x00\x00\x00\x00",
-			Gateway:     "",
+			Destination: header.IPv4EmptySubnet,
 			NIC:         1,
 		},
 	})
@@ -153,7 +170,7 @@ func main() {
 
 	// Bind if a port is specified.
 	if localPort != 0 {
-		if err := ep.Bind(tcpip.FullAddress{0, "", localPort}, nil); err != nil {
+		if err := ep.Bind(tcpip.FullAddress{0, "", localPort}); err != nil {
 			log.Fatal("Bind failed: ", err)
 		}
 	}
@@ -183,7 +200,7 @@ func main() {
 	// connection from its side.
 	wq.EventRegister(&waitEntry, waiter.EventIn)
 	for {
-		v, err := ep.Read(nil)
+		v, _, err := ep.Read(nil)
 		if err != nil {
 			if err == tcpip.ErrClosedForReceive {
 				break

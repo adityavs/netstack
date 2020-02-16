@@ -1,6 +1,16 @@
-// Copyright 2017 The Netstack Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package waitable
 
@@ -25,13 +35,18 @@ type countedEndpoint struct {
 	dispatcher stack.NetworkDispatcher
 }
 
-func (e *countedEndpoint) DeliverNetworkPacket(linkEP stack.LinkEndpoint, remoteLinkAddr tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, vv *buffer.VectorisedView) {
+func (e *countedEndpoint) DeliverNetworkPacket(linkEP stack.LinkEndpoint, remote, local tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt tcpip.PacketBuffer) {
 	e.dispatchCount++
 }
 
 func (e *countedEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
 	e.attachCount++
 	e.dispatcher = dispatcher
+}
+
+// IsAttached implements stack.LinkEndpoint.IsAttached.
+func (e *countedEndpoint) IsAttached() bool {
+	return e.dispatcher != nil
 }
 
 func (e *countedEndpoint) MTU() uint32 {
@@ -50,31 +65,45 @@ func (e *countedEndpoint) LinkAddress() tcpip.LinkAddress {
 	return e.linkAddr
 }
 
-func (e *countedEndpoint) WritePacket(r *stack.Route, hdr *buffer.Prependable, payload buffer.View, protocol tcpip.NetworkProtocolNumber) *tcpip.Error {
+func (e *countedEndpoint) WritePacket(r *stack.Route, _ *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt tcpip.PacketBuffer) *tcpip.Error {
 	e.writeCount++
 	return nil
 }
 
+// WritePackets implements stack.LinkEndpoint.WritePackets.
+func (e *countedEndpoint) WritePackets(r *stack.Route, _ *stack.GSO, hdrs []stack.PacketDescriptor, payload buffer.VectorisedView, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
+	e.writeCount += len(hdrs)
+	return len(hdrs), nil
+}
+
+func (e *countedEndpoint) WriteRawPacket(buffer.VectorisedView) *tcpip.Error {
+	e.writeCount++
+	return nil
+}
+
+// Wait implements stack.LinkEndpoint.Wait.
+func (*countedEndpoint) Wait() {}
+
 func TestWaitWrite(t *testing.T) {
 	ep := &countedEndpoint{}
-	_, wep := New(stack.RegisterLinkEndpoint(ep))
+	wep := New(ep)
 
 	// Write and check that it goes through.
-	wep.WritePacket(nil, nil, nil, 0)
+	wep.WritePacket(nil, nil /* gso */, 0, tcpip.PacketBuffer{})
 	if want := 1; ep.writeCount != want {
 		t.Fatalf("Unexpected writeCount: got=%v, want=%v", ep.writeCount, want)
 	}
 
 	// Wait on dispatches, then try to write. It must go through.
 	wep.WaitDispatch()
-	wep.WritePacket(nil, nil, nil, 0)
+	wep.WritePacket(nil, nil /* gso */, 0, tcpip.PacketBuffer{})
 	if want := 2; ep.writeCount != want {
 		t.Fatalf("Unexpected writeCount: got=%v, want=%v", ep.writeCount, want)
 	}
 
 	// Wait on writes, then try to write. It must not go through.
 	wep.WaitWrite()
-	wep.WritePacket(nil, nil, nil, 0)
+	wep.WritePacket(nil, nil /* gso */, 0, tcpip.PacketBuffer{})
 	if want := 2; ep.writeCount != want {
 		t.Fatalf("Unexpected writeCount: got=%v, want=%v", ep.writeCount, want)
 	}
@@ -82,7 +111,7 @@ func TestWaitWrite(t *testing.T) {
 
 func TestWaitDispatch(t *testing.T) {
 	ep := &countedEndpoint{}
-	_, wep := New(stack.RegisterLinkEndpoint(ep))
+	wep := New(ep)
 
 	// Check that attach happens.
 	wep.Attach(ep)
@@ -91,21 +120,21 @@ func TestWaitDispatch(t *testing.T) {
 	}
 
 	// Dispatch and check that it goes through.
-	ep.dispatcher.DeliverNetworkPacket(ep, "", 0, nil)
+	ep.dispatcher.DeliverNetworkPacket(ep, "", "", 0, tcpip.PacketBuffer{})
 	if want := 1; ep.dispatchCount != want {
 		t.Fatalf("Unexpected dispatchCount: got=%v, want=%v", ep.dispatchCount, want)
 	}
 
 	// Wait on writes, then try to dispatch. It must go through.
 	wep.WaitWrite()
-	ep.dispatcher.DeliverNetworkPacket(ep, "", 0, nil)
+	ep.dispatcher.DeliverNetworkPacket(ep, "", "", 0, tcpip.PacketBuffer{})
 	if want := 2; ep.dispatchCount != want {
 		t.Fatalf("Unexpected dispatchCount: got=%v, want=%v", ep.dispatchCount, want)
 	}
 
 	// Wait on dispatches, then try to dispatch. It must not go through.
 	wep.WaitDispatch()
-	ep.dispatcher.DeliverNetworkPacket(ep, "", 0, nil)
+	ep.dispatcher.DeliverNetworkPacket(ep, "", "", 0, tcpip.PacketBuffer{})
 	if want := 2; ep.dispatchCount != want {
 		t.Fatalf("Unexpected dispatchCount: got=%v, want=%v", ep.dispatchCount, want)
 	}
@@ -124,7 +153,7 @@ func TestOtherMethods(t *testing.T) {
 		hdrLen:       hdrLen,
 		linkAddr:     linkAddr,
 	}
-	_, wep := New(stack.RegisterLinkEndpoint(ep))
+	wep := New(ep)
 
 	if v := wep.MTU(); v != mtu {
 		t.Fatalf("Unexpected mtu: got=%v, want=%v", v, mtu)

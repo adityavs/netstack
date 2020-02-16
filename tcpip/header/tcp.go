@@ -1,26 +1,38 @@
-// Copyright 2016 The Netstack Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package header
 
 import (
 	"encoding/binary"
 
+	"github.com/google/btree"
 	"github.com/google/netstack/tcpip"
 	"github.com/google/netstack/tcpip/seqnum"
 )
 
+// These constants are the offsets of the respective fields in the TCP header.
 const (
-	srcPort     = 0
-	dstPort     = 2
-	seqNum      = 4
-	ackNum      = 8
-	dataOffset  = 12
-	tcpFlags    = 13
-	winSize     = 14
-	tcpChecksum = 16
-	urgentPtr   = 18
+	TCPSrcPortOffset   = 0
+	TCPDstPortOffset   = 2
+	TCPSeqNumOffset    = 4
+	TCPAckNumOffset    = 8
+	TCPDataOffset      = 12
+	TCPFlagsOffset     = 13
+	TCPWinSizeOffset   = 14
+	TCPChecksumOffset  = 16
+	TCPUrgentPtrOffset = 18
 )
 
 const (
@@ -110,6 +122,8 @@ type TCPSynOptions struct {
 }
 
 // SACKBlock represents a single contiguous SACK block.
+//
+// +stateify savable
 type SACKBlock struct {
 	// Start indicates the lowest sequence number in the block.
 	Start seqnum.Value
@@ -119,8 +133,20 @@ type SACKBlock struct {
 	End seqnum.Value
 }
 
+// Less returns true if r.Start < b.Start.
+func (r SACKBlock) Less(b btree.Item) bool {
+	return r.Start.LessThan(b.(SACKBlock).Start)
+}
+
+// Contains returns true if b is completely contained in r.
+func (r SACKBlock) Contains(b SACKBlock) bool {
+	return r.Start.LessThanEq(b.Start) && b.End.LessThanEq(r.End)
+}
+
 // TCPOptions are used to parse and cache the TCP segment options for a non
 // syn/syn-ack segment.
+//
+// +stateify savable
 type TCPOptions struct {
 	// TS is true if the TimeStamp option is enabled.
 	TS bool
@@ -142,33 +168,54 @@ const (
 	// TCPMinimumSize is the minimum size of a valid TCP packet.
 	TCPMinimumSize = 20
 
+	// TCPOptionsMaximumSize is the maximum size of TCP options.
+	TCPOptionsMaximumSize = 40
+
+	// TCPHeaderMaximumSize is the maximum header size of a TCP packet.
+	TCPHeaderMaximumSize = TCPMinimumSize + TCPOptionsMaximumSize
+
 	// TCPProtocolNumber is TCP's transport protocol number.
 	TCPProtocolNumber tcpip.TransportProtocolNumber = 6
+
+	// TCPMinimumMSS is the minimum acceptable value for MSS. This is the
+	// same as the value TCP_MIN_MSS defined net/tcp.h.
+	TCPMinimumMSS = IPv4MaximumHeaderSize + TCPHeaderMaximumSize + MinIPFragmentPayloadSize - IPv4MinimumSize - TCPMinimumSize
+
+	// TCPMaximumMSS is the maximum acceptable value for MSS.
+	TCPMaximumMSS = 0xffff
+
+	// TCPDefaultMSS is the MSS value that should be used if an MSS option
+	// is not received from the peer. It's also the value returned by
+	// TCP_MAXSEG option for a socket in an unconnected state.
+	//
+	// Per RFC 1122, page 85: "If an MSS option is not received at
+	// connection setup, TCP MUST assume a default send MSS of 536."
+	TCPDefaultMSS = 536
 )
 
 // SourcePort returns the "source port" field of the tcp header.
 func (b TCP) SourcePort() uint16 {
-	return binary.BigEndian.Uint16(b[srcPort:])
+	return binary.BigEndian.Uint16(b[TCPSrcPortOffset:])
 }
 
 // DestinationPort returns the "destination port" field of the tcp header.
 func (b TCP) DestinationPort() uint16 {
-	return binary.BigEndian.Uint16(b[dstPort:])
+	return binary.BigEndian.Uint16(b[TCPDstPortOffset:])
 }
 
 // SequenceNumber returns the "sequence number" field of the tcp header.
 func (b TCP) SequenceNumber() uint32 {
-	return binary.BigEndian.Uint32(b[seqNum:])
+	return binary.BigEndian.Uint32(b[TCPSeqNumOffset:])
 }
 
 // AckNumber returns the "ack number" field of the tcp header.
 func (b TCP) AckNumber() uint32 {
-	return binary.BigEndian.Uint32(b[ackNum:])
+	return binary.BigEndian.Uint32(b[TCPAckNumOffset:])
 }
 
 // DataOffset returns the "data offset" field of the tcp header.
 func (b TCP) DataOffset() uint8 {
-	return (b[dataOffset] >> 4) * 4
+	return (b[TCPDataOffset] >> 4) * 4
 }
 
 // Payload returns the data in the tcp packet.
@@ -178,47 +225,40 @@ func (b TCP) Payload() []byte {
 
 // Flags returns the flags field of the tcp header.
 func (b TCP) Flags() uint8 {
-	return b[tcpFlags]
+	return b[TCPFlagsOffset]
 }
 
 // WindowSize returns the "window size" field of the tcp header.
 func (b TCP) WindowSize() uint16 {
-	return binary.BigEndian.Uint16(b[winSize:])
+	return binary.BigEndian.Uint16(b[TCPWinSizeOffset:])
 }
 
 // Checksum returns the "checksum" field of the tcp header.
 func (b TCP) Checksum() uint16 {
-	return binary.BigEndian.Uint16(b[tcpChecksum:])
+	return binary.BigEndian.Uint16(b[TCPChecksumOffset:])
 }
 
 // SetSourcePort sets the "source port" field of the tcp header.
 func (b TCP) SetSourcePort(port uint16) {
-	binary.BigEndian.PutUint16(b[srcPort:], port)
+	binary.BigEndian.PutUint16(b[TCPSrcPortOffset:], port)
 }
 
 // SetDestinationPort sets the "destination port" field of the tcp header.
 func (b TCP) SetDestinationPort(port uint16) {
-	binary.BigEndian.PutUint16(b[dstPort:], port)
+	binary.BigEndian.PutUint16(b[TCPDstPortOffset:], port)
 }
 
 // SetChecksum sets the checksum field of the tcp header.
 func (b TCP) SetChecksum(checksum uint16) {
-	binary.BigEndian.PutUint16(b[tcpChecksum:], checksum)
+	binary.BigEndian.PutUint16(b[TCPChecksumOffset:], checksum)
 }
 
-// CalculateChecksum calculates the checksum of the tcp segment given
-// the totalLen and partialChecksum(descriptions below)
-// totalLen is the total length of the segment
+// CalculateChecksum calculates the checksum of the tcp segment.
 // partialChecksum is the checksum of the network-layer pseudo-header
-// (excluding the total length) and the checksum of the segment data.
-func (b TCP) CalculateChecksum(partialChecksum uint16, totalLen uint16) uint16 {
-	// Add the length portion of the checksum to the pseudo-checksum.
-	tmp := make([]byte, 2)
-	binary.BigEndian.PutUint16(tmp, totalLen)
-	checksum := Checksum(tmp, partialChecksum)
-
+// and the checksum of the segment data.
+func (b TCP) CalculateChecksum(partialChecksum uint16) uint16 {
 	// Calculate the rest of the checksum.
-	return Checksum(b[:b.DataOffset()], checksum)
+	return Checksum(b[:b.DataOffset()], partialChecksum)
 }
 
 // Options returns a slice that holds the unparsed TCP options in the segment.
@@ -234,20 +274,20 @@ func (b TCP) ParsedOptions() TCPOptions {
 }
 
 func (b TCP) encodeSubset(seq, ack uint32, flags uint8, rcvwnd uint16) {
-	binary.BigEndian.PutUint32(b[seqNum:], seq)
-	binary.BigEndian.PutUint32(b[ackNum:], ack)
-	b[tcpFlags] = flags
-	binary.BigEndian.PutUint16(b[winSize:], rcvwnd)
+	binary.BigEndian.PutUint32(b[TCPSeqNumOffset:], seq)
+	binary.BigEndian.PutUint32(b[TCPAckNumOffset:], ack)
+	b[TCPFlagsOffset] = flags
+	binary.BigEndian.PutUint16(b[TCPWinSizeOffset:], rcvwnd)
 }
 
 // Encode encodes all the fields of the tcp header.
 func (b TCP) Encode(t *TCPFields) {
 	b.encodeSubset(t.SeqNum, t.AckNum, t.Flags, t.WindowSize)
-	binary.BigEndian.PutUint16(b[srcPort:], t.SrcPort)
-	binary.BigEndian.PutUint16(b[dstPort:], t.DstPort)
-	b[dataOffset] = (t.DataOffset / 4) << 4
-	binary.BigEndian.PutUint16(b[tcpChecksum:], t.Checksum)
-	binary.BigEndian.PutUint16(b[urgentPtr:], t.UrgentPointer)
+	binary.BigEndian.PutUint16(b[TCPSrcPortOffset:], t.SrcPort)
+	binary.BigEndian.PutUint16(b[TCPDstPortOffset:], t.DstPort)
+	b[TCPDataOffset] = (t.DataOffset / 4) << 4
+	binary.BigEndian.PutUint16(b[TCPChecksumOffset:], t.Checksum)
+	binary.BigEndian.PutUint16(b[TCPUrgentPtrOffset:], t.UrgentPointer)
 }
 
 // EncodePartial updates a subset of the fields of the tcp header. It is useful
@@ -266,8 +306,8 @@ func (b TCP) EncodePartial(partialChecksum, length uint16, seqnum, acknum uint32
 	b.encodeSubset(seqnum, acknum, flags, rcvwnd)
 
 	// Add the contributions of the passed-in fields to the checksum.
-	checksum = Checksum(b[seqNum:seqNum+8], checksum)
-	checksum = Checksum(b[winSize:winSize+2], checksum)
+	checksum = Checksum(b[TCPSeqNumOffset:TCPSeqNumOffset+8], checksum)
+	checksum = Checksum(b[TCPWinSizeOffset:TCPWinSizeOffset+2], checksum)
 
 	// Encode the checksum.
 	b.SetChecksum(^checksum)
@@ -281,7 +321,7 @@ func ParseSynOptions(opts []byte, isAck bool) TCPSynOptions {
 	synOpts := TCPSynOptions{
 		// Per RFC 1122, page 85: "If an MSS option is not received at
 		// connection setup, TCP MUST assume a default send MSS of 536."
-		MSS: 536,
+		MSS: TCPDefaultMSS,
 		// If no window scale option is specified, WS in options is
 		// returned as -1; this is because the absence of the option
 		// indicates that the we cannot use window scaling on the

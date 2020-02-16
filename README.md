@@ -1,3 +1,8 @@
+> NOTE: This repository is no longer maintained. The Netstack code will continue
+> to be updated and maintained as part of
+> [gVisor](http://www.github.com/google/gvisor/tree/go), which now also
+> maintains a branch that is useable with standard Go tools.
+
 # Netstack
 
 Netstack is a network stack written in Go.
@@ -26,13 +31,16 @@ tun_tcp_echo <device-name> <ipv4-address> <port>
 
 ## Contributions
 
-We would love to accept contributions, but we have not yet worked
-out how to handle them. Please contact us before sending any pull requests.
-
-Whatever we do decide on will require signing the Google Contributor License.
 Please see [CONTRIBUTING.md](CONTRIBUTING.md) for more details.
+
+## Issues/Bug Reports
+
+Netstack is primarily developed as part of
+[gVisor](http://www.github.com/google/gvisor) and any issues/bugs should be
+filed against the gVisor repository as this repo is not actively monitored for
+bug reports.
 
 ### Disclaimer
 
-This is not an official Google product (experimental or otherwise), it
-is just code that happens to be owned by Google.
+This is not an official Google product (experimental or otherwise), it is just
+code that happens to be owned by Google.

@@ -1,6 +1,18 @@
-// Copyright 2016 The Netstack Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// +build linux
 
 // This sample creates a stack with TCP and IPv4 protocols on top of a TUN
 // device, and listens on a port. Data received by the server in the accepted
@@ -42,7 +54,7 @@ func echo(wq *waiter.Queue, ep tcpip.Endpoint) {
 	defer wq.EventUnregister(&waitEntry)
 
 	for {
-		v, err := ep.Read(nil)
+		v, _, err := ep.Read(nil)
 		if err != nil {
 			if err == tcpip.ErrWouldBlock {
 				<-notifyCh
@@ -99,7 +111,10 @@ func main() {
 
 	// Create the stack with ip and tcp protocols, then add a tun-based
 	// NIC and address.
-	s := stack.New([]string{ipv4.ProtocolName, ipv6.ProtocolName, arp.ProtocolName}, []string{tcp.ProtocolName})
+	s := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocol{ipv4.NewProtocol(), ipv6.NewProtocol(), arp.NewProtocol()},
+		TransportProtocols: []stack.TransportProtocol{tcp.NewProtocol()},
+	})
 
 	mtu, err := rawfile.GetMTU(tunName)
 	if err != nil {
@@ -116,13 +131,16 @@ func main() {
 		log.Fatal(err)
 	}
 
-	linkID := fdbased.New(&fdbased.Options{
-		FD:             fd,
+	linkEP, err := fdbased.New(&fdbased.Options{
+		FDs:            []int{fd},
 		MTU:            mtu,
 		EthernetHeader: *tap,
 		Address:        tcpip.LinkAddress(maddr),
 	})
-	if err := s.CreateNIC(1, linkID); err != nil {
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := s.CreateNIC(1, linkEP); err != nil {
 		log.Fatal(err)
 	}
 
@@ -134,12 +152,15 @@ func main() {
 		log.Fatal(err)
 	}
 
+	subnet, err := tcpip.NewSubnet(tcpip.Address(strings.Repeat("\x00", len(addr))), tcpip.AddressMask(strings.Repeat("\x00", len(addr))))
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	// Add default route.
 	s.SetRouteTable([]tcpip.Route{
 		{
-			Destination: tcpip.Address(strings.Repeat("\x00", len(addr))),
-			Mask:        tcpip.Address(strings.Repeat("\x00", len(addr))),
-			Gateway:     "",
+			Destination: subnet,
 			NIC:         1,
 		},
 	})
@@ -153,7 +174,7 @@ func main() {
 
 	defer ep.Close()
 
-	if err := ep.Bind(tcpip.FullAddress{0, "", uint16(localPort)}, nil); err != nil {
+	if err := ep.Bind(tcpip.FullAddress{0, "", uint16(localPort)}); err != nil {
 		log.Fatal("Bind failed: ", err)
 	}
 

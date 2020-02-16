@@ -1,6 +1,16 @@
-// Copyright 2016 The Netstack Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 // Package tcpconntrack implements a TCP connection tracking object. It allows
 // users with access to a segment stream to figure out when a connection is
@@ -57,7 +67,7 @@ type TCB struct {
 }
 
 // Init initializes the state of the TCB according to the initial SYN.
-func (t *TCB) Init(initialSyn header.TCP) {
+func (t *TCB) Init(initialSyn header.TCP) Result {
 	t.handlerInbound = synSentStateInbound
 	t.handlerOutbound = synSentStateOutbound
 
@@ -73,6 +83,7 @@ func (t *TCB) Init(initialSyn header.TCP) {
 	t.inbound.nxt = 0
 	t.inbound.end = seqnum.Value(initialSyn.WindowSize())
 	t.state = ResultConnecting
+	return t.state
 }
 
 // UpdateStateInbound updates the state of the TCB based on the supplied inbound
@@ -104,6 +115,11 @@ func (t *TCB) IsAlive() bool {
 // OutboundSendSequenceNumber returns the snd.NXT for the outbound stream.
 func (t *TCB) OutboundSendSequenceNumber() seqnum.Value {
 	return t.outbound.nxt
+}
+
+// InboundSendSequenceNumber returns the snd.NXT for the inbound stream.
+func (t *TCB) InboundSendSequenceNumber() seqnum.Value {
+	return t.inbound.nxt
 }
 
 // adapResult modifies the supplied "Result" according to the state of the TCB;

@@ -1,6 +1,16 @@
-// Copyright 2016 The Netstack Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package tcp
 
@@ -8,7 +18,6 @@ import (
 	"sync"
 
 	"github.com/google/netstack/tcpip"
-	"github.com/google/netstack/tcpip/buffer"
 	"github.com/google/netstack/tcpip/header"
 	"github.com/google/netstack/tcpip/seqnum"
 	"github.com/google/netstack/tcpip/stack"
@@ -37,13 +46,13 @@ type Forwarder struct {
 // If rcvWnd is set to zero, the default buffer size is used instead.
 func NewForwarder(s *stack.Stack, rcvWnd, maxInFlight int, handler func(*ForwarderRequest)) *Forwarder {
 	if rcvWnd == 0 {
-		rcvWnd = DefaultBufferSize
+		rcvWnd = DefaultReceiveBufferSize
 	}
 	return &Forwarder{
 		maxInFlight: maxInFlight,
 		handler:     handler,
 		inFlight:    make(map[stack.TransportEndpointID]struct{}),
-		listen:      newListenContext(s, seqnum.Size(rcvWnd), true, 0),
+		listen:      newListenContext(s, nil /* listenEP */, seqnum.Size(rcvWnd), true, 0),
 	}
 }
 
@@ -53,12 +62,12 @@ func NewForwarder(s *stack.Stack, rcvWnd, maxInFlight int, handler func(*Forward
 //
 // This function is expected to be passed as an argument to the
 // stack.SetTransportProtocolHandler function.
-func (f *Forwarder) HandlePacket(r *stack.Route, id stack.TransportEndpointID, vv *buffer.VectorisedView) bool {
-	s := newSegment(r, id, vv)
+func (f *Forwarder) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pkt tcpip.PacketBuffer) bool {
+	s := newSegment(r, id, pkt)
 	defer s.decRef()
 
 	// We only care about well-formed SYN packets.
-	if !s.parse() || s.flags != flagSyn {
+	if !s.parse() || !s.csumValid || s.flags != header.TCPFlagSyn {
 		return false
 	}
 
